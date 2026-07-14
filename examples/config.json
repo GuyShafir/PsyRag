@@ -1,0 +1,30 @@
+{
+  "alpha": 0.05,
+  "lambda_base": 0.05,
+  "beta": 1.0,
+  "w0": 0.5,
+  "r_clip": 1.0,
+  "setpoint": 0.5,
+  "k_i": 0.02,
+  "ewma_beta": 0.8,
+  "scale_min": 0.25,
+  "scale_max": 8.0,
+  "integral_min": -500.0,
+  "integral_max": 500.0,
+  "depth": 2,
+  "fan": 0.9,
+  "activation_epsilon": 1e-06,
+  "theta": 0.01,
+  "norm_target": 1.0,
+  "authority_default": 0.0,
+  "authority_by_kind": {
+    "SERVES": 4.0,
+    "CONNECTS": 1.0
+  },
+  "functional_kinds": [
+    "SERVES"
+  ],
+  "feedback_gamma": 0.5,
+  "feedback_hit": 1.0,
+  "feedback_miss_penalty": 0.0
+}

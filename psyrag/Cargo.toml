@@ -1,0 +1,20 @@
+[package]
+name = "psyrag"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "psyrag"
+path = "src/main.rs"
+
+[features]
+default = ["gcp"]
+gcp = ["psyrag-graph/gcp"]
+
+[dependencies]
+psyrag-graph = { path = "../psyrag-graph", default-features = false }
+psyrag-core = { path = "../psyrag-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"

@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>PsyRag · memory console</title>
+<style>
+  :root{--bg:#0e1116;--panel:#161b22;--line:#232a34;--fg:#d7dde5;--mut:#8b97a7;
+        --acc:#4aa3ff;--good:#39d98a;--warn:#ffb454;--bad:#ff6b6b;--live:#2f81f7;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+  header{display:flex;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  header .dot{width:9px;height:9px;border-radius:50%;background:var(--bad);display:inline-block;margin-right:6px}
+  header .dot.ok{background:var(--good)}
+  nav{display:flex;gap:4px;margin-left:auto}
+  nav button{background:transparent;border:1px solid transparent;color:var(--mut);padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit}
+  nav button.active{background:var(--bg);color:var(--fg);border-color:var(--line)}
+  main{padding:16px;max-width:1200px;margin:0 auto}
+  .tab{display:none} .tab.on{display:block}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
+  .card .k{color:var(--mut);font-size:12px} .card .v{font-size:22px;margin-top:2px}
+  .bar{height:7px;background:var(--bg);border-radius:4px;margin-top:8px;overflow:hidden}
+  .bar>i{display:block;height:100%;background:var(--acc)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0}
+  input,textarea,select{background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:7px 9px;font:inherit}
+  input[type=number]{width:88px} input.seed{min-width:220px}
+  button.act{background:var(--acc);border:1px solid var(--acc);color:#04101f;padding:7px 13px;border-radius:6px;cursor:pointer;font:inherit;font-weight:600}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);padding:7px 13px;border-radius:6px;cursor:pointer;font:inherit}
+  svg{width:100%;height:460px;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);font-size:13px}
+  th{color:var(--mut);font-weight:500}
+  .pill{padding:1px 7px;border-radius:20px;background:var(--bg);border:1px solid var(--line);font-size:12px;color:var(--mut)}
+  .muted{color:var(--mut)} .mono{font-family:inherit}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:260px}
+  h3{margin:18px 0 6px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
+  .legend{font-size:12px;color:var(--mut);margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1><span id="dot" class="dot"></span>PsyRag</h1>
+  <span id="sub" class="muted">connecting…</span>
+  <nav>
+    <button data-tab="dash" class="active">Dashboard</button>
+    <button data-tab="graph">Graph</button>
+    <button data-tab="retr">Retrieve &amp; Trace</button>
+    <button data-tab="mng">Manage</button>
+  </nav>
+</header>
+<main>
+  <!-- DASHBOARD -->
+  <section id="dash" class="tab on">
+    <div class="row"><label><input type="checkbox" id="auto" checked/> auto-refresh</label>
+      <button class="ghost" onclick="loadStats()">refresh</button></div>
+    <div class="cards" id="cards"></div>
+    <h3>homeostat</h3>
+    <div class="cards" id="homeo"></div>
+  </section>
+
+  <!-- GRAPH -->
+  <section id="graph" class="tab">
+    <div class="row"><button class="act" onclick="loadGraph()">load graph</button>
+      <span class="muted" id="gmeta"></span></div>
+    <svg id="gsvg"></svg>
+    <div class="legend">edge width = current weight · faded = retired · click a node to use it as a retrieval seed</div>
+  </section>
+
+  <!-- RETRIEVE & TRACE -->
+  <section id="retr" class="tab">
+    <div class="row">
+      <input class="seed" id="seeds" placeholder="seeds (comma separated), e.g. api,db"/>
+      depth<input type="number" id="depth" value="2" min="1"/>
+      top-k<input type="number" id="topk" value="8" min="1"/>
+      ts<input type="number" id="ts" placeholder="now"/>
+      <button class="act" onclick="doRetrieve()">retrieve + trace</button>
+    </div>
+    <svg id="tsvg"></svg>
+    <div class="legend">node size/color = activation · highlighted edges fired during this retrieval</div>
+    <div class="row" id="fbrow" style="display:none">
+      <span class="pill">trace #<span id="tid"></span></span>
+      <button class="act" onclick="sendUsed()">mark checked as used ✓</button>
+      reward<input type="number" id="reward" value="1.0" step="0.1"/>
+      <select id="spread"><option value="by_activation">by_activation</option><option value="uniform">uniform</option></select>
+      <button class="ghost" onclick="sendReward()">send episodic reward</button>
+      <span class="muted" id="fbout"></span>
+    </div>
+    <table id="rtbl"></table>
+  </section>
+
+  <!-- MANAGE -->
+  <section id="mng" class="tab">
+    <h3>ingest entities</h3>
+    <div class="row"><textarea id="ingest" rows="4" style="width:100%" placeholder='[{"name":"api","type":"svc","edges":[{"dst":"db","kind":"CALLS"}]}]'></textarea></div>
+    <div class="row"><label><input type="checkbox" id="reconcile"/> reconcile</label>
+      <button class="act" onclick="doIngest()">ingest</button><span class="muted" id="ingout"></span></div>
+    <h3>consolidate</h3>
+    <div class="row"><label><input type="checkbox" id="applyc"/> apply conflicts (journal supersessions)</label>
+      <button class="act" onclick="doConsolidate()">run consolidation</button></div>
+    <pre id="consout" style="display:none"></pre>
+    <h3>stored traces (durable)</h3>
+    <div class="row"><button class="ghost" onclick="loadTraces()">list traces</button><span class="muted" id="tmeta"></span></div>
+    <div id="tlist" class="row"></div>
+  </section>
+</main>
+<script>
+const $=s=>document.querySelector(s), api=(p,o)=>fetch(p,o).then(r=>r.json());
+const jpost=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+// tabs
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+  b.classList.add('active'); $('#'+b.dataset.tab).classList.add('on');
+});
+
+// ---------- dashboard ----------
+function bar(v,max){const p=Math.max(0,Math.min(100,100*v/(max||1)));return `<div class="bar"><i style="width:${p}%"></i></div>`}
+async function loadStats(){
+  let s; try{s=await api('/stats')}catch(e){$('#dot').classList.remove('ok');$('#sub').textContent='offline';return}
+  $('#dot').classList.add('ok');$('#sub').textContent='connected';
+  $('#cards').innerHTML=[
+    ['nodes',s.nodes],['edges total',s.edges_total],['edges live',s.edges_live],['edges dead',s.edges_dead],
+    ['weight mean',(s.weight_mean||0).toFixed(3)],['weight max',(s.weight_max||0).toFixed(3)]
+  ].map(([k,v])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  $('#homeo').innerHTML=[
+    ['λ-scale',(s.lambda_scale||0).toFixed(3),8],['setpoint',(s.setpoint||0).toFixed(3),1],
+    ['ewma mass',(s.ewma_mass||0).toFixed(3),(s.setpoint||1)*2],['integral',(s.integral||0).toFixed(1),null]
+  ].map(([k,v,mx])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div>${mx?bar(parseFloat(v),mx):''}</div>`).join('');
+}
+setInterval(()=>{if($('#auto').checked && $('#dash').classList.contains('on'))loadStats()},1500);
+loadStats();
+
+// ---------- tiny force layout + svg render ----------
+function render(svg,nodes,edges,opts={}){
+  const W=svg.clientWidth||900,H=460;
+  nodes.forEach(n=>{if(n.x==null){n.x=W/2+(Math.random()-.5)*200;n.y=H/2+(Math.random()-.5)*200;n.vx=0;n.vy=0}});
+  const idx={};nodes.forEach((n,i)=>idx[n.id]=i);
+  for(let it=0;it<220;it++){
+    for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
+      const a=nodes[i],b=nodes[j];let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+.01,f=1600/d2;
+      const d=Math.sqrt(d2);a.vx+=f*dx/d;a.vy+=f*dy/d;b.vx-=f*dx/d;b.vy-=f*dy/d;}
+    edges.forEach(e=>{const a=nodes[idx[e.source]],b=nodes[idx[e.target]];if(!a||!b)return;
+      let dx=b.x-a.x,dy=b.y-a.y,d=Math.sqrt(dx*dx+dy*dy)+.01,f=(d-90)*.02;
+      a.vx+=f*dx/d;a.vy+=f*dy/d;b.vx-=f*dx/d;b.vy-=f*dy/d;});
+    nodes.forEach(n=>{n.vx+=(W/2-n.x)*.002;n.vy+=(H/2-n.y)*.002;n.x+=n.vx*=.85;n.y+=n.vy*=.85;
+      n.x=Math.max(20,Math.min(W-20,n.x));n.y=Math.max(20,Math.min(H-20,n.y));});
+  }
+  const act=opts.act||{}, fired=opts.fired||new Set();
+  const el=e=>`<line x1="${nodes[idx[e.source]].x}" y1="${nodes[idx[e.source]].y}" x2="${nodes[idx[e.target]].x}" y2="${nodes[idx[e.target]].y}" stroke="${fired.has(e.source+'>'+e.target)?'#4aa3ff':'#39415a'}" stroke-width="${fired.has(e.source+'>'+e.target)?2.5:Math.max(.4,Math.min(5,(e.weight||.3)*4))}" stroke-opacity="${e.open===false?0.25:0.8}"/>`;
+  const nl=n=>{const a=act[n.id]||0,r=6+Math.min(16,a*16),c=a>0?'#39d98a':(opts.seedSet&&opts.seedSet.has(n.name)?'#ffb454':'#4aa3ff');
+    return `<g class="nd" data-name="${n.name}" style="cursor:pointer"><circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${c}" fill-opacity="0.85"/><text x="${n.x}" y="${n.y-r-3}" fill="#c7d0da" font-size="10" text-anchor="middle">${n.name}</text></g>`};
+  svg.innerHTML=edges.map(el).join('')+nodes.map(nl).join('');
+  svg.querySelectorAll('.nd').forEach(g=>g.onclick=()=>{const nm=g.dataset.name;
+    const cur=$('#seeds').value.split(',').map(s=>s.trim()).filter(Boolean);
+    if(!cur.includes(nm))cur.push(nm);$('#seeds').value=cur.join(',');
+    document.querySelector('nav button[data-tab=retr]').click();});
+}
+
+// ---------- graph ----------
+let GRAPH=null;
+async function loadGraph(){
+  const g=await api('/graph');GRAPH=g;
+  $('#gmeta').textContent=`${g.nodes.length} nodes · ${g.edges.length} edges${g.truncated?' (truncated)':''}`;
+  render($('#gsvg'),g.nodes.map(n=>({...n})),g.edges);
+}
+
+// ---------- retrieve + trace ----------
+let LASTTID=null,LASTSURF=[];
+async function doRetrieve(){
+  const seeds=$('#seeds').value.split(',').map(s=>s.trim()).filter(Boolean);
+  if(!seeds.length)return;
+  const body={seeds,depth:+$('#depth').value,top_k:+$('#topk').value,trace:true};
+  if($('#ts').value)body.ts=+$('#ts').value;
+  const r=await jpost('/retrieve',body);const res=r.result||r;LASTTID=r.trace_id;
+  const top=res.top||[];LASTSURF=top.map(t=>t.node);
+  $('#tid').textContent=r.trace_id;$('#fbrow').style.display='flex';$('#fbout').textContent='';
+  $('#rtbl').innerHTML='<tr><th></th><th>node</th><th>type</th><th>activation</th></tr>'+
+    top.map(t=>`<tr><td><input type="checkbox" class="usechk" value="${t.node}"></td><td>${t.node}</td><td class="muted">${t.node_type||''}</td><td>${(t.activation||0).toFixed(4)}</td></tr>`).join('');
+  // visualize the trace subgraph
+  if(!GRAPH){await loadGraph();}
+  const NM={};GRAPH.nodes.forEach(n=>NM[n.name]=n.id);
+  const act={};top.forEach(t=>{if(NM[t.node]!=null)act[NM[t.node]]=t.activation;});
+  const tr=await api('/trace/'+r.trace_id).catch(()=>({fired:[]}));
+  const fired=new Set((tr.fired||[]).map(f=>NM[f.src]+'>'+NM[f.dst]));
+  const ids=new Set([...seeds.map(s=>NM[s]),...top.map(t=>NM[t.node])].filter(x=>x!=null));
+  const sub=subgraph(GRAPH,ids);
+  render($('#tsvg'),sub.nodes.map(n=>({...n})),sub.edges,{act,fired,seedSet:new Set(seeds)});
+}
+function subgraph(g,ids){const ns=g.nodes.filter(n=>ids.has(n.id));const s=new Set(ns.map(n=>n.id));
+  return {nodes:ns,edges:g.edges.filter(e=>s.has(e.source)&&s.has(e.target))}}
+async function sendUsed(){
+  const used=[...document.querySelectorAll('.usechk:checked')].map(c=>c.value);
+  if(!used.length||LASTTID==null){$('#fbout').textContent='check some nodes first';return}
+  const r=await jpost('/feedback',{trace_id:LASTTID,used});
+  $('#fbout').textContent=`+${r.total_positive_r.toFixed(2)} over ${r.edges_reinforced} edges`;
+}
+async function sendReward(){
+  if(LASTTID==null)return;
+  const r=await jpost('/feedback',{trace_id:LASTTID,reward:+$('#reward').value,spread:$('#spread').value});
+  $('#fbout').textContent=`reward → ${r.edges_reinforced} edges (+${r.total_positive_r.toFixed(2)}/${r.total_negative_r.toFixed(2)})`;
+}
+
+// ---------- manage ----------
+async function doIngest(){
+  try{const r=await jpost('/ingest',{json:$('#ingest').value,reconcile:$('#reconcile').checked});
+    $('#ingout').textContent=`ok · ${r.edges} edges, ${r.stale_retired} retired`;GRAPH=null;}
+  catch(e){$('#ingout').textContent='error: '+e}
+}
+async function doConsolidate(){
+  const r=await jpost('/consolidate',{apply_conflicts:$('#applyc').checked});
+  $('#consout').style.display='block';$('#consout').textContent=JSON.stringify(r,null,2);
+}
+async function loadTraces(){
+  const r=await api('/traces');$('#tmeta').textContent=`${r.count} stored`;
+  $('#tlist').innerHTML=(r.ids||[]).slice(-40).reverse().map(id=>`<button class="ghost" onclick="showTrace(${id})">#${id}</button>`).join('');
+}
+async function showTrace(id){
+  const tr=await api('/trace/'+id);
+  document.querySelector('nav button[data-tab=retr]').click();
+  if(!GRAPH)await loadGraph();
+  const m={};GRAPH.nodes.forEach(n=>m[n.name]=n.id);
+  const ids=new Set();(tr.surfaced||[]).forEach(s=>ids.add(m[s.node]));(tr.fired||[]).forEach(f=>{ids.add(m[f.src]);ids.add(m[f.dst])});
+  const act={};(tr.surfaced||[]).forEach(s=>act[m[s.node]]=s.activation);
+  const fired=new Set((tr.fired||[]).map(f=>m[f.src]+'>'+m[f.dst]));
+  const sub=subgraph(GRAPH,ids);
+  render($('#tsvg'),sub.nodes.map(n=>({...n})),sub.edges,{act,fired});
+  $('#fbrow').style.display='flex';$('#tid').textContent=id;LASTTID=id;
+}
+</script>
+</body>
+</html>

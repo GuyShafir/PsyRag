@@ -1,0 +1,10 @@
+services:
+  psyrag:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - psyrag-data:/data          # persists WAL, plasticity sidecar, durable traces
+    restart: unless-stopped
+volumes:
+  psyrag-data:

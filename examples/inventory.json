@@ -1,0 +1,9 @@
+[
+  {"name":"svc/api","type":"run/Service","props":{"rev":"v3"},"edges":[
+    {"dst":"db/primary","kind":"CONNECTS"},
+    {"dst":"cache/redis","kind":"CONNECTS"},
+    {"dst":"lb/blue","kind":"SERVES"},
+    {"dst":"lb/green","kind":"SERVES"}]},
+  {"name":"db/primary","type":"sql/Instance","edges":[{"dst":"net/vpc","kind":"IN"}]},
+  {"name":"cache/redis","type":"mem/Instance","edges":[{"dst":"net/vpc","kind":"IN"}]}
+]

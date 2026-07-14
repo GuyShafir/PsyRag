@@ -1,0 +1,11 @@
+[package]
+name = "psyrag-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Hebbian plasticity / adaptive-retrieval salience layer over driftgraph. Time-decayed weighted edges, homeostatic normalization, spreading-activation retrieval, consolidation."
+
+[dependencies]
+psyrag-graph = { path = "../psyrag-graph", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
