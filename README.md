@@ -88,8 +88,4 @@ PsyRag is one product, three Rust crates:
 Plus a **`python/`** package (ADK memory service, adapters, client) and optional
 **`gcp/`** backends.
 
-## Status
 
-Working, tested (26 unit + 7 end-to-end assertions, all green from a clean
-build). The Spanner `GraphBackend` implementation is specified but not yet built;
-everything else runs today. License: Apache-2.0.
