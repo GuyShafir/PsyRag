@@ -82,7 +82,7 @@ fn partial_snapshot_is_not_evidence_of_absence() {
 
 #[test]
 fn generic_entities_persist_through_wal() {
-    let path = std::env::temp_dir().join("driftgraph_generic.wal");
+    let path = std::env::temp_dir().join("psyrag_generic.wal");
     let _ = std::fs::remove_file(&path);
     {
         let mut pg = PersistentGraph::open(&path).unwrap();

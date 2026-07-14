@@ -6,7 +6,7 @@
 //!
 //!   w_ij(t) = w_ij(t_prev) * e^{-lambda*dt} + alpha*R
 //!
-//! Design (see DESIGN.md), and the boundaries the psyrag-graph code makes explicit:
+//! Design (see docs/architecture.md), and the boundaries the psyrag-graph code makes explicit:
 //!
 //! * **Sidecar, keyed by `EdgeId`.** psyrag-graph is append-only, so `EdgeId` is a
 //!   stable dense index; plasticity state lives in parallel columns indexed by it.

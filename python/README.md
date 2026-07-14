@@ -80,7 +80,7 @@ signal maps to a mode:
 
 All three are ~5 lines over `PsyRagClient` and run standalone against `psyrag serve`.
 
-## The strong case for Google Cloud: adaptive blast-radius over Cloud Asset Inventory
+## Example: adaptive blast-radius over Cloud Asset Inventory
 
 psyrag-graph already ingests GCP Cloud Asset Inventory (`psyrag ingest --cai`) into a
 temporal typed property graph — projects, networks, IAM, PSC, the works. Blast
@@ -100,13 +100,13 @@ Plasticity makes it **learn which dependency paths actually matter**:
    decays out of the retrieved blast radius.
 
 The result is an SRE memory that gets sharper with every incident — built on GCP
-primitives (CAI, Vertex/Gemini agents via ADK), self-hostable, no vendor lock on
-the memory layer. That's the demo to put in front of customer engineers.
+primitives (CAI, Vertex/Gemini agents via ADK), self-hostable, with no vendor lock
+on the memory layer itself.
 
 ## Honest caveats
 
 - **Extraction quality** is the user's problem, same as Memory Bank (which uses an
-  LLM). Our differentiator is adaptive *recall*, not extraction. The structured
+  LLM). The distinction here is adaptive *recall*, not extraction. The structured
   path (feed domain events, seed on entity names) sidesteps it entirely.
 - **Causal caveat**: usage credit means "on a path to something useful," not
   "causal." Keep edge kinds `predicts`/`precedes`, never `causes`.

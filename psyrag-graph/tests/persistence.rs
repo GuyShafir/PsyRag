@@ -44,7 +44,7 @@ const VPC: &str = "//compute.googleapis.com/projects/p/global/networks/vpc";
 
 #[test]
 fn wal_roundtrip_preserves_history() {
-    let path = std::env::temp_dir().join("driftgraph_roundtrip.wal");
+    let path = std::env::temp_dir().join("psyrag_roundtrip.wal");
     let _ = fs::remove_file(&path);
 
     // Session 1: two snapshots with drift (image bump, subnet swap).
@@ -79,7 +79,7 @@ fn wal_roundtrip_preserves_history() {
 
 #[test]
 fn torn_tail_is_tolerated() {
-    let path = std::env::temp_dir().join("driftgraph_torn.wal");
+    let path = std::env::temp_dir().join("psyrag_torn.wal");
     let _ = fs::remove_file(&path);
     {
         let mut pg = PersistentGraph::open(&path).unwrap();

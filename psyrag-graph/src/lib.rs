@@ -1,4 +1,4 @@
-//! # driftgraph
+//! # psyrag-graph
 //!
 //! Embeddable temporal typed property graph for any inventory of typed,
 //! named entities — cloud resources, Kubernetes objects, CMDB records,

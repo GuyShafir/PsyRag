@@ -10,7 +10,7 @@ conflate them:
    replay. **BigQuery**. This is what `export-bq` produces (below).
 
 The architecture, the coarse `GraphBackend` seam, indexing, and the sleep/wake
-flush between tiers are specified in `../DESIGN.md` §7c–7e. Summary of the rule
+flush between tiers are specified in `../docs/architecture.md` §7c–7e. Summary of the rule
 that governs everything: **the backend boundary is per-query / per-cycle, never
 per-edge** — `neighborhood(seeds, depth, at_ts)` returns a whole k-hop subgraph in
 one round trip; the plasticity compute stays in-process.
@@ -76,20 +76,20 @@ bq query --use_legacy_sql=false < schema.sql     # creates the property graph
 - **Where salience concentrates** — per-source share of learned weight, i.e.
   which resources have a single dominant dependency vs. diffuse ones.
 
-## The pitch for Google Cloud CEs
+## Example: adaptive dependency analysis
 
-This is the closing move on the adaptive-blast-radius story: the SRE agent learns
-which dependency paths matter (plasticity, over incidents), and that learned
-structure lands in **BigQuery** as a property graph the whole org can query with
-GQL — dashboards, alerting, capacity planning, all over salience rather than raw
-topology. It pulls BigQuery (and GQL property graphs) into the deal, on top of
-Vertex/Gemini (the ADK agent) and Cloud Asset Inventory (ingest).
+A concrete use case: ingest Cloud Asset Inventory snapshots as the dependency
+graph, retrieve the blast radius of a resource during an incident, and reward the
+paths that led to the actual root cause when it resolves. Over many incidents the
+graph learns which dependency edges matter, and that learned structure exports to
+BigQuery as a property graph the whole org can query with GQL — for dashboards,
+alerting, or capacity planning over salience rather than raw topology.
 
 ## Which GCP backend?
 
-BigQuery is the analytics sink shown here (append-only, GQL, CE sales target). If
+BigQuery is the analytics sink shown here (append-only, GQL property graphs). If
 you'd rather back the *operational* state — the WAL, plasticity sidecar, or the
-durable trace store — **AlloyDB** is the better fit (transactional, low-latency,
+durable trace store — **AlloyDB** is a good fit (transactional, low-latency,
 Postgres-compatible), and the trace store's NDJSON append model ports to an
 AlloyDB table with minimal change. Spanner if you need multi-region. The export
 seam here is deliberately simple so any of these can sit behind it.

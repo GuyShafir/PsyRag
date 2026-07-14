@@ -4,8 +4,8 @@
 //! — a natural sink. This writes the plasticity-weighted graph as BQ-ready NDJSON
 //! plus DDL (including a `CREATE PROPERTY GRAPH`), a `bq load` script, and example
 //! GQL/SQL. No GCP credentials are needed to produce the artifacts; loading them
-//! uses the operator's own project. The pitch for Google CEs: run GQL over the
-//! salience the layer *learned*, not just the raw inventory.
+//! uses the operator's own project. The point: run GQL over the salience the
+//! layer *learned*, not just the raw inventory.
 
 use crate::engine::Engine;
 use psyrag_graph::graph::T_MAX;

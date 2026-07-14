@@ -59,7 +59,7 @@ def default_extractor(session, max_terms: int = 16) -> str:
     co-occurrence edges are what make recall work: seeding on one query term
     spreads to the terms it was mentioned alongside. Crude on purpose — real
     deployments plug in NER / an LLM extractor, or feed structured domain events
-    directly. Returns driftgraph entity JSON (array)."""
+    directly. Returns psyrag-graph entity JSON (array)."""
     import json
 
     sid = getattr(session, "id", None) or getattr(session, "session_id", "session")
@@ -164,7 +164,7 @@ class PsyRagMemoryService(BaseMemoryService):
             text = f"{t['node']} [{t.get('node_type','')}] (salience {t.get('activation',0):.3f})"
             memories.append(MemoryEntry(
                 content=types.Content(parts=[types.Part(text=text)], role="model"),
-                author="driftgraph",
+                author="psyrag",
                 timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             ))
         return SearchMemoryResponse(memories=memories)
