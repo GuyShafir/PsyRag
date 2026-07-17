@@ -1,0 +1,1 @@
+{"w":[0.9,0.5],"t_last":[1000,1000],"neg_lambda":[-0.05,-0.05],"dead":[false,false],"lambda_scale":1.0,"homeo":{"setpoint":0.5,"k_i":0.02,"integral":0.0,"ewma_mass":0.0,"ewma_beta":0.8,"scale_min":0.25,"scale_max":8.0,"i_min":-500.0,"i_max":500.0,"primed":false}}

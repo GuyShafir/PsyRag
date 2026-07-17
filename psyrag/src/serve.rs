@@ -61,9 +61,73 @@ enum Scope {
     Read,
 }
 
+/// A JSON response as (status, bytes) — kept in this form so idempotent
+/// replays can cache and re-serve it byte-identically.
+struct JsonOut {
+    code: u16,
+    body: Vec<u8>,
+}
+fn jout<T: serde::Serialize>(v: &T, code: u16) -> JsonOut {
+    JsonOut { code, body: serde_json::to_vec(v).unwrap_or_default() }
+}
+fn jerr(msg: &str, code: u16) -> JsonOut {
+    jout(&serde_json::json!({ "error": msg }), code)
+}
+impl JsonOut {
+    fn into_resp(self, replayed: bool) -> Resp {
+        let mut r = Response::from_data(self.body)
+            .with_status_code(self.code)
+            .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+        if replayed {
+            r = r.with_header("Idempotency-Replayed: true".parse::<tiny_http::Header>().unwrap());
+        }
+        r
+    }
+}
+
+/// In-memory idempotent-retry dedup: replays the stored response for a
+/// repeated (endpoint, Idempotency-Key) within the window. Dedup spans the
+/// process lifetime only — durable dedup across restarts is future work
+/// (needs WAL stamping).
+const IDEM_CAP: usize = 4096;
+const IDEM_WINDOW: Duration = Duration::from_secs(24 * 3600);
+const IDEM_INFLIGHT_STALE: Duration = Duration::from_secs(60);
+
+enum IdemEntry {
+    InFlight { at: Instant },
+    Done { code: u16, body: Vec<u8>, at: Instant },
+}
+#[derive(Default)]
+struct IdemCache {
+    map: HashMap<String, IdemEntry>,
+    order: std::collections::VecDeque<String>,
+}
+impl IdemCache {
+    fn evict(&mut self) {
+        while self.order.len() > IDEM_CAP {
+            if let Some(k) = self.order.pop_front() {
+                self.map.remove(&k);
+            }
+        }
+        while let Some(k) = self.order.front() {
+            let stale = match self.map.get(k) {
+                Some(IdemEntry::Done { at, .. }) => at.elapsed() > IDEM_WINDOW,
+                Some(IdemEntry::InFlight { .. }) | None => false,
+            };
+            if stale {
+                let k = self.order.pop_front().unwrap();
+                self.map.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 struct Db {
     engine: RwLock<Engine>,
     last_used: Mutex<Instant>,
+    idem: Mutex<IdemCache>,
 }
 
 struct Registry {
@@ -81,6 +145,8 @@ pub fn valid_db_name(s: &str) -> bool {
 fn open_engine_at(wal: &str, sidecar: &str, cfg: Config) -> Result<Engine, String> {
     let pg = PersistentGraph::open(wal)?;
     let mut layer = PlasticityLayer::new(cfg);
+    // Bind BEFORE load so a sidecar from a different WAL is refused loudly.
+    layer.set_wal_binding(pg.wal_id(), pg.lsn());
     layer.load_if_exists(pg.graph(), sidecar)?;
     layer.sync(pg.graph());
     let traces = TraceStore::open(4096, &format!("{sidecar}.traces.jsonl"));
@@ -89,6 +155,7 @@ fn open_engine_at(wal: &str, sidecar: &str, cfg: Config) -> Result<Engine, Strin
         layer,
         sidecar_path: sidecar.to_string(),
         traces,
+        wedged: None,
     })
 }
 
@@ -176,6 +243,7 @@ impl Registry {
         let db = Arc::new(Db {
             engine: RwLock::new(engine),
             last_used: Mutex::new(Instant::now()),
+            idem: Mutex::new(IdemCache::default()),
         });
         map.insert(name.to_string(), db.clone());
         Ok(db)
@@ -213,8 +281,7 @@ impl Registry {
             if let Err(er) = e.pg.flush() {
                 eprintln!("psyrag: shutdown flush of db '{name}' WAL failed: {er}");
             }
-            let sidecar = e.sidecar_path.clone();
-            if let Err(er) = e.layer.save(e.pg.graph(), &sidecar) {
+            if let Err(er) = e.save_sidecar() {
                 eprintln!("psyrag: shutdown save of db '{name}' sidecar failed: {er}");
             }
         }
@@ -256,6 +323,10 @@ struct RetrieveReq {
     /// Store the trace and return a `trace_id` for deferred feedback.
     #[serde(default)]
     trace: bool,
+    /// Return the activation paths (fired edges) alongside the result.
+    /// Read-only; allowed under the read scope.
+    #[serde(default)]
+    explain: bool,
 }
 fn d_match_limit() -> usize {
     16
@@ -406,6 +477,11 @@ fn handle_request(reg: &Arc<Registry>, mut request: Request) {
         _ => match reg.auth(&request) {
             Err(resp) => resp,
             Ok(scope) => {
+                let idem_key = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Idempotency-Key"))
+                    .map(|h| h.value.as_str().to_string());
                 // Bounded body read (413 on oversize) for methods that carry one.
                 let body = if matches!(method, Method::Post | Method::Put | Method::Delete) {
                     match read_body(&mut request, reg.opts.max_body) {
@@ -418,7 +494,7 @@ fn handle_request(reg: &Arc<Registry>, mut request: Request) {
                 } else {
                     String::new()
                 };
-                route(reg, scope, &method, &path, &body)
+                route(reg, scope, &method, &path, &body, idem_key.as_deref())
             }
         },
     };
@@ -459,7 +535,7 @@ fn split_route(path: &str) -> (String, String) {
     }
 }
 
-fn route(reg: &Arc<Registry>, scope: Scope, method: &Method, path: &str, body: &str) -> Resp {
+fn route(reg: &Arc<Registry>, scope: Scope, method: &Method, path: &str, body: &str, idem_key: Option<&str>) -> Resp {
     // Server-level admin routes.
     if path == "/dbs" && *method == Method::Get {
         return list_dbs(reg);
@@ -487,7 +563,7 @@ fn route(reg: &Arc<Registry>, scope: Scope, method: &Method, path: &str, body: &
     }
 
     match reg.resolve(&name, false) {
-        Ok(db) => handle_db(reg, &db, scope, method, &db_route, body),
+        Ok(db) => handle_db(reg, &db, scope, method, &db_route, body, idem_key),
         Err((code, msg)) => err(&msg, code),
     }
 }
@@ -522,6 +598,7 @@ fn list_dbs(reg: &Arc<Registry>) -> Resp {
                     "nodes": e.pg.graph().node_count(),
                     "edges": e.pg.graph().edge_count(),
                     "traces": e.traces.len(),
+                    "wedged": e.wedged,
                 }),
                 Err(_) => serde_json::json!({"db": n, "open": true, "busy": true}),
             },
@@ -575,6 +652,7 @@ fn handle_db(
     method: &Method,
     path: &str,
     body: &str,
+    idem_key: Option<&str>,
 ) -> Resp {
     match (method, path) {
         (Method::Get, "/ui") => html(UI_HTML),
@@ -674,6 +752,16 @@ fn handle_db(
             }
             let ts = r.ts.unwrap_or_else(now_ms);
             let seeds: Vec<&str> = r.seeds.iter().map(|s| s.as_str()).collect();
+            // Renders a trace's fired edges as the explain payload.
+            let explain_json = |g: &psyrag_graph::TemporalGraph, tr: &psyrag_core::Trace| {
+                let fired: Vec<_> = tr.fired().iter().map(|(eid, u, v, d)| {
+                    serde_json::json!({
+                        "src": g.node_name(*u), "dst": g.node_name(*v),
+                        "kind": g.kind_str(g.edge(*eid).kind_id), "delta": d,
+                    })
+                }).collect();
+                serde_json::json!({"fired": fired})
+            };
             if r.adapt || r.trace {
                 let mut guard = db.engine.write().unwrap();
                 let e = &mut *guard;
@@ -684,11 +772,20 @@ fn handle_db(
                 if r.adapt {
                     res.lambda_scale = e.layer.observe(res.mass);
                 }
+                let explain = r.explain.then(|| explain_json(e.pg.graph(), &tr));
                 if r.trace {
                     match e.traces.put(tr) {
-                        Ok(id) => json_resp(&serde_json::json!({"result": res, "trace_id": id}), 200),
+                        Ok(id) => {
+                            let mut body = serde_json::json!({"result": res, "trace_id": id});
+                            if let Some(x) = explain {
+                                body["explain"] = x;
+                            }
+                            json_resp(&body, 200)
+                        }
                         Err(msg) => err(&format!("trace not persisted: {msg}"), 500),
                     }
+                } else if let Some(x) = explain {
+                    json_resp(&serde_json::json!({"result": res, "explain": x}), 200)
                 } else {
                     json_resp(&res, 200)
                 }
@@ -696,8 +793,14 @@ fn handle_db(
                 let e = db.engine.read().unwrap();
                 let depth = r.depth.unwrap_or(e.layer.cfg.depth);
                 let fan = r.fan.unwrap_or(e.layer.cfg.fan);
-                let res = e.layer.retrieve(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
-                json_resp(&res, 200)
+                if r.explain {
+                    let (res, tr) =
+                        e.layer.retrieve_traced(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
+                    json_resp(&serde_json::json!({"result": res, "explain": explain_json(e.pg.graph(), &tr)}), 200)
+                } else {
+                    let res = e.layer.retrieve(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
+                    json_resp(&res, 200)
+                }
             }
         }
         _ => {
@@ -705,7 +808,53 @@ fn handle_db(
             if scope != Scope::Full {
                 return err("write scope required", 403);
             }
-            handle_db_write(reg, db, method, path, body)
+            // A wedged database (WAL write failed after in-memory apply)
+            // refuses writes; reads above keep serving.
+            if let Some(w) = db.engine.read().unwrap().wedged.clone() {
+                return err(
+                    &format!("database is wedged read-only (WAL write failed: {w}); restart the server after fixing the disk"),
+                    503,
+                );
+            }
+            let Some(key) = idem_key else {
+                return handle_db_write(reg, db, method, path, body).into_resp(false);
+            };
+            // Idempotent retry: replay the stored response for a repeated
+            // (endpoint, key); serialize concurrent duplicates.
+            let cache_key = format!("{method} {path} {key}");
+            {
+                let mut c = db.idem.lock().unwrap();
+                c.evict();
+                match c.map.get(&cache_key) {
+                    Some(IdemEntry::Done { code, body, .. }) => {
+                        return JsonOut { code: *code, body: body.clone() }.into_resp(true);
+                    }
+                    Some(IdemEntry::InFlight { at }) if at.elapsed() < IDEM_INFLIGHT_STALE => {
+                        return err("a request with this Idempotency-Key is already in flight", 409);
+                    }
+                    _ => {
+                        if !c.map.contains_key(&cache_key) {
+                            c.order.push_back(cache_key.clone());
+                        }
+                        c.map.insert(cache_key.clone(), IdemEntry::InFlight { at: Instant::now() });
+                    }
+                }
+            }
+            let out = handle_db_write(reg, db, method, path, body);
+            let mut c = db.idem.lock().unwrap();
+            if out.code < 500 {
+                // Cache final outcomes (2xx/4xx). 5xx are transient: the
+                // retry SHOULD reprocess, so drop the in-flight marker.
+                c.map.insert(
+                    cache_key,
+                    IdemEntry::Done { code: out.code, body: out.body.clone(), at: Instant::now() },
+                );
+            } else {
+                c.map.remove(&cache_key);
+                c.order.retain(|k| k != &cache_key);
+            }
+            drop(c);
+            out.into_resp(false)
         }
     }
 }
@@ -716,24 +865,24 @@ fn handle_db_write(
     method: &Method,
     path: &str,
     body: &str,
-) -> Resp {
+) -> JsonOut {
     match (method, path) {
         (Method::Post, "/ingest") => {
             let r: IngestReq = match serde_json::from_str(body) {
                 Ok(r) => r,
-                Err(e) => return err(&format!("bad body: {e}"), 400),
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
             };
             // Validate the payload BEFORE touching the store so bad input is
             // a 400 and a failed ingest of valid input is a 500.
             if r.cai {
                 #[cfg(feature = "gcp")]
                 if let Err(e) = psyrag_graph::gcp::parse_snapshot(&r.json) {
-                    return err(&format!("bad CAI snapshot: {e}"), 400);
+                    return jerr(&format!("bad CAI snapshot: {e}"), 400);
                 }
                 #[cfg(not(feature = "gcp"))]
-                return err("built without gcp feature", 400);
+                return jerr("built without gcp feature", 400);
             } else if let Err(e) = psyrag_graph::entity::parse_entities(&r.json) {
-                return err(&format!("bad entities: {e}"), 400);
+                return jerr(&format!("bad entities: {e}"), 400);
             }
             let ts = r.ts.unwrap_or_else(now_ms);
             let mut guard = db.engine.write().unwrap();
@@ -753,15 +902,20 @@ fn handle_db_write(
             match res {
                 Ok(stale) => {
                     e.layer.sync(e.pg.graph());
-                    json_resp(&serde_json::json!({"stale_retired": stale, "edges": e.pg.graph().edge_count()}), 200)
+                    jout(&serde_json::json!({"stale_retired": stale, "edges": e.pg.graph().edge_count()}), 200)
                 }
-                Err(msg) => err(&msg, 500),
+                Err(msg) => {
+                    // Ops may be applied in memory but unacked on disk:
+                    // memory/disk have diverged, so wedge read-only.
+                    e.wedge(&msg);
+                    jerr(&format!("ingest failed mid-write; database wedged read-only: {msg}"), 500)
+                }
             }
         }
         (Method::Post, "/touch") => {
             let r: TouchReq = match serde_json::from_str(body) {
                 Ok(r) => r,
-                Err(e) => return err(&format!("bad body: {e}"), 400),
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
             };
             let ts = r.ts.unwrap_or_else(now_ms);
             let mut guard = db.engine.write().unwrap();
@@ -775,12 +929,12 @@ fn handle_db_write(
                 }
             }
             e.layer.touch(&touches, ts);
-            json_resp(&serde_json::json!({"touched": touches.len(), "missed": missed}), 200)
+            jout(&serde_json::json!({"touched": touches.len(), "missed": missed}), 200)
         }
         (Method::Post, "/feedback") => {
             let r: FeedbackReq = match serde_json::from_str(body) {
                 Ok(r) => r,
-                Err(e) => return err(&format!("bad body: {e}"), 400),
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
             };
             let ts = r.ts.unwrap_or_else(now_ms);
             let mut guard = db.engine.write().unwrap();
@@ -794,13 +948,13 @@ fn handle_db_write(
             } else if let Some(used) = r.used.clone() {
                 Credit::Nodes(used.into_iter().map(|n| (n, hit)).collect())
             } else {
-                return err("feedback needs one of: nodes, reward, used", 400);
+                return jerr("feedback needs one of: nodes, reward, used", 400);
             };
             // get the trace: deferred (trace_id) or stateless (recompute)
             let trace = if let Some(id) = r.trace_id {
                 match e.traces.get(id) {
                     Some(t) => t,
-                    None => return err("unknown trace_id (evicted or never issued)", 404),
+                    None => return jerr("unknown trace_id (evicted or never issued)", 404),
                 }
             } else if let Some(seeds) = r.seeds.clone() {
                 let sref: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
@@ -809,14 +963,13 @@ fn handle_db_write(
                 let (_res, tr) = e.layer.retrieve_traced(e.pg.graph(), &sref, depth, fan, r.top_k, ts);
                 tr
             } else {
-                return err("feedback needs trace_id or seeds", 400);
+                return jerr("feedback needs trace_id or seeds", 400);
             };
             let report = e.layer.apply_credit(e.pg.graph(), &trace, &credit, ts);
-            let sidecar = e.sidecar_path.clone();
-            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
-                return err(&format!("feedback applied but not persisted: {msg}"), 500);
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("feedback applied but not persisted: {msg}"), 500);
             }
-            json_resp(&report, 200)
+            jout(&report, 200)
         }
         (Method::Post, "/sleep") => {
             let ts: i64 = serde_json::from_str::<serde_json::Value>(body)
@@ -829,11 +982,10 @@ fn handle_db_write(
                 let g = e.pg.graph();
                 e.layer.sleep(g, ts)
             };
-            let sidecar = e.sidecar_path.clone();
-            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
-                return err(&format!("sleep ran but not persisted: {msg}"), 500);
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("sleep ran but not persisted: {msg}"), 500);
             }
-            json_resp(&rep, 200)
+            jout(&rep, 200)
         }
         (Method::Post, "/checkpoint") => {
             #[derive(Deserialize)]
@@ -846,27 +998,31 @@ fn handle_db_write(
             } else {
                 match serde_json::from_str(body) {
                     Ok(r) => r,
-                    Err(e) => return err(&format!("bad body: {e}"), 400),
+                    Err(e) => return jerr(&format!("bad body: {e}"), 400),
                 }
             };
             let mut guard = db.engine.write().unwrap();
             let e = &mut *guard;
             let report = match e.pg.compact(r.archive) {
                 Ok(rep) => rep,
-                Err(msg) => return err(&format!("checkpoint failed: {msg}"), 500),
+                Err(msg) => {
+                    // Compaction failures can leave the writer mid-swap;
+                    // wedge rather than risk appending to the wrong file.
+                    e.wedge(&msg);
+                    return jerr(&format!("checkpoint failed; database wedged read-only: {msg}"), 500);
+                }
             };
             // Sidecar v2 keys are stable across the renumbering the next
             // replay performs, so saving against the (old-id) in-memory
             // graph is correct.
-            let sidecar = e.sidecar_path.clone();
-            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
-                return err(&format!("checkpoint done but sidecar not persisted: {msg}"), 500);
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("checkpoint done but sidecar not persisted: {msg}"), 500);
             }
             // Outstanding traces reference pre-compaction dense ids.
             if let Err(msg) = e.traces.clear() {
-                return err(&format!("checkpoint done but trace log not cleared: {msg}"), 500);
+                return jerr(&format!("checkpoint done but trace log not cleared: {msg}"), 500);
             }
-            json_resp(&serde_json::json!({
+            jout(&serde_json::json!({
                 "report": report,
                 "traces_cleared": true,
                 "note": "in-memory graph keeps full history until restart; the on-disk log is compacted",
@@ -878,7 +1034,7 @@ fn handle_db_write(
             } else {
                 match serde_json::from_str(body) {
                     Ok(r) => r,
-                    Err(e) => return err(&format!("bad body: {e}"), 400),
+                    Err(e) => return jerr(&format!("bad body: {e}"), 400),
                 }
             };
             let ts = r.ts.unwrap_or_else(now_ms);
@@ -893,22 +1049,24 @@ fn handle_db_write(
             if r.apply_conflicts {
                 for c in &conflicts {
                     for op in &c.superseded {
-                        if e.pg.record_op(op.clone()).is_ok() {
-                            applied += 1;
+                        if let Err(msg) = e.pg.record_op(op.clone()) {
+                            e.wedge(&msg);
+                            return jerr(&format!("conflict op not journaled; database wedged read-only: {msg}"), 500);
                         }
+                        applied += 1;
                     }
                 }
                 if let Err(msg) = e.pg.flush() {
-                    return err(&format!("conflict ops not persisted: {msg}"), 500);
+                    e.wedge(&msg);
+                    return jerr(&format!("conflict ops not persisted; database wedged read-only: {msg}"), 500);
                 }
                 e.layer.sync(e.pg.graph());
             }
-            let sidecar = e.sidecar_path.clone();
-            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
-                return err(&format!("consolidation ran but not persisted: {msg}"), 500);
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("consolidation ran but not persisted: {msg}"), 500);
             }
-            json_resp(&serde_json::json!({"stats": stats, "conflicts": conflicts, "applied_ops": applied}), 200)
+            jout(&serde_json::json!({"stats": stats, "conflicts": conflicts, "applied_ops": applied}), 200)
         }
-        _ => err("not found", 404),
+        _ => jerr("not found", 404),
     }
 }

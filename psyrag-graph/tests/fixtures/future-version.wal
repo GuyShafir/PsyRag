@@ -1,0 +1,2 @@
+#psyrag-wal:v9 id=deadbeefdeadbeef
+{"op":"observe_node","name":"x","asset_type":"t/x","props":null,"ts":1000}

@@ -1,0 +1,1 @@
+{"psyrag_sidecar":2,"wal_id":"e8f4e9762060a6e1","wal_lsn":6,"keys":[2231632903708260618,10027217847970045053],"w":[0.5256147,0.5],"t_last":[2000,1000],"neg_lambda":[-0.05,-0.05],"dead":[false,false],"lambda_scale":1.0,"homeo":{"setpoint":0.5,"k_i":0.02,"integral":0.0,"ewma_mass":0.0,"ewma_beta":0.8,"scale_min":0.25,"scale_max":8.0,"i_min":-500.0,"i_max":500.0,"primed":false}}

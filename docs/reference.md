@@ -36,6 +36,18 @@ own `config.json` > built-in defaults. DB names match `[a-z0-9_-]{1,64}`.
 - The WAL is held under an exclusive lock (`flock`): running the CLI against a
   WAL a live `psyrag serve` owns fails fast with a clear error. Use the HTTP
   API against a running server.
+- **Visibility contract**: a write is visible to reads the moment its 2xx is
+  returned (single in-process store, no replication lag) and durable at that
+  same moment (fsync before ack). There is no read-your-writes gap to reason
+  about.
+- **Fail-clean writes**: if a WAL write/flush fails AFTER ops were applied in
+  memory (e.g. ENOSPC), memory and disk have diverged and cannot be
+  reconciled in-process — the database **wedges read-only** (writes return
+  503, reads keep serving, `/dbs` shows `wedged`). Restart the server after
+  fixing the disk; replay restores exactly what the WAL acked.
+- **Formats are versioned and refuse forward loudly**: a WAL or sidecar
+  written by a newer psyrag fails to open with an explicit message after a
+  rollback — restore the pre-upgrade backup or upgrade again.
 
 ## CLI commands
 
@@ -136,6 +148,15 @@ of them with `/db/{name}` to address another database (multi-DB mode):
 isolated — separate WAL, sidecar, traces, config, and locks; one DB's ingest
 never blocks another DB's retrieval.
 
+**Idempotent retries.** Every mutating endpoint accepts an
+`Idempotency-Key` header. A repeated (endpoint, key) within the window
+(process lifetime, 24h, 4096 entries per DB) replays the original response
+byte-identically with `Idempotency-Replayed: true` — an at-least-once retry
+can never double-ingest or double-apply credit. Final outcomes (2xx/4xx) are
+cached; 5xx are not (the retry should reprocess). Concurrent duplicates get
+409. The Python client generates keys automatically and retries with the
+same key. *(Dedup does not yet survive a server restart.)*
+
 **Auth.** With `--token`/`--read-token` set, every endpoint except
 `/health`, `/live`, `/ready`, and the UI shell requires
 `Authorization: Bearer <token>`. The read token may hit GET endpoints,
@@ -173,10 +194,14 @@ Sidecar + graph stats: `nodes`, `edges_total`, `edges_live`, `edges_dead`,
 `{ "edges", "nodes", "stale_retired" }`.
 
 ### `POST /retrieve`
-`{ "seeds": [..], "depth"?, "fan"?, "top_k"?, "ts"?, "adapt"?: bool, "trace"?: bool }`.
+`{ "seeds": [..], "depth"?, "fan"?, "top_k"?, "ts"?, "adapt"?: bool, "trace"?: bool, "explain"?: bool }`.
 Returns `{ mass, lambda_scale, top: [{node, node_type, activation}] }`. If
 `"trace": true`, returns `{ result, trace_id }` and stores the trace for deferred
-feedback.
+feedback. If `"explain": true`, the response carries
+`explain.fired: [{src, dst, kind, delta}]` — the activation paths, in hop
+order ("why did it recall X"). Explain is read-only and allowed under the
+read scope. Retrieval is deterministic: identical inputs at an identical `ts`
+return identical results (ties break by ingestion order).
 
 ### `POST /match`
 `{ "tokens": [..], "limit"? }` → `{ "nodes": [names] }`. Resolve free-text tokens

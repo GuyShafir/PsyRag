@@ -44,6 +44,11 @@ psyrag serve --addr 0.0.0.0:8080 --token "$ADMIN_TOKEN" --read-token "$VIEWER_TO
   binds. `DELETE /db/{name}` is disabled entirely in open mode.
 - TLS: terminate at a reverse proxy (nginx/Caddy/Cloud Run); the server
   speaks plain HTTP.
+- **Traces are sensitive data**: the durable trace log persists retrieval
+  structure derived from queries/conversations to disk unencrypted, and the
+  WAL persists ingested facts. Encrypt the volume (LUKS/EBS/PD encryption)
+  in any deployment handling user content; an application-level redaction
+  hook at trace-write time is on the roadmap.
 
 ## Multi-database (isolation)
 
@@ -141,9 +146,11 @@ Asserts, exiting non-zero on any failure:
 9. **single-writer lock** — the CLI is refused while the server owns the WAL,
 10. **checkpoint** — the WAL shrinks, verifies, and learned salience survives
     the id renumbering (stable sidecar keys),
-11. **backup** — manifest + consistent file set.
+11. **backup** — manifest + consistent file set,
+12. **idempotent retry** — a repeated Idempotency-Key returns the identical
+    response from the replay cache and never double-applies.
 
-Expected tail: `==== 16 passed, 0 failed ====`.
+Expected tail: `==== 18 passed, 0 failed ====`.
 
 ### Python / ADK
 ```bash

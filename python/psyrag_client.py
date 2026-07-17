@@ -8,22 +8,33 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import urllib.error
 import urllib.request
+import uuid
 from typing import Any, Optional
 
 
 class PsyRagClient:
     def __init__(self, base_url: str = "http://127.0.0.1:8080", timeout: float = 5.0,
-                 *, db: Optional[str] = None, token: Optional[str] = None):
+                 *, db: Optional[str] = None, token: Optional[str] = None,
+                 retries: int = 2, retry_backoff: float = 0.25):
         """`db` addresses a named database on a multi-DB server (routes become
         `/db/{db}/...`); omit it for the default database. `token` is sent as
-        `Authorization: Bearer` when the server runs with --token."""
+        `Authorization: Bearer` when the server runs with --token.
+
+        Mutating calls (ingest/feedback/consolidate) automatically carry an
+        `Idempotency-Key` and are retried up to `retries` times on network
+        errors / 5xx **with the same key**, so an at-least-once retry can
+        never double-apply (the server replays the original response)."""
         self._root = base_url.rstrip("/")
         self.base = self._root
         if db:
             self.base += f"/db/{db}"
         self.timeout = timeout
         self.token = token
+        self.retries = retries
+        self.retry_backoff = retry_backoff
 
     # -- low-level ----------------------------------------------------------
     def _headers(self) -> dict:
@@ -32,15 +43,35 @@ class PsyRagClient:
             h["Authorization"] = f"Bearer {self.token}"
         return h
 
-    def _post_sync(self, path: str, body: dict) -> dict:
-        req = urllib.request.Request(
-            self.base + path,
-            data=json.dumps(body).encode(),
-            headers=self._headers(),
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read().decode())
+    def _post_sync(self, path: str, body: dict,
+                   idem_key: Optional[str] = None) -> dict:
+        headers = self._headers()
+        if idem_key:
+            headers["Idempotency-Key"] = idem_key
+        data = json.dumps(body).encode()
+        attempts = (self.retries + 1) if idem_key else 1
+        last: Exception = RuntimeError("unreachable")
+        for i in range(attempts):
+            try:
+                req = urllib.request.Request(
+                    self.base + path, data=data, headers=headers, method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    raise  # 4xx is final; replaying it is the server's job
+                last = e
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last = e
+            if i < attempts - 1:
+                time.sleep(self.retry_backoff * (2 ** i))
+        raise last
+
+    async def _post_idem(self, path: str, body: dict,
+                         idem_key: Optional[str] = None) -> dict:
+        key = idem_key or uuid.uuid4().hex
+        return await asyncio.to_thread(self._post_sync, path, body, key)
 
     def _get_sync(self, path: str) -> dict:
         req = urllib.request.Request(self.base + path, headers=self._headers())
@@ -65,7 +96,7 @@ class PsyRagClient:
         body: dict[str, Any] = {"json": entities_json, "reconcile": reconcile, "cai": cai}
         if ts is not None:
             body["ts"] = ts
-        return await self._post("/ingest", body)
+        return await self._post_idem("/ingest", body)
 
     async def retrieve(self, seeds: list[str], depth: Optional[int] = None,
                        top_k: int = 10, ts: Optional[int] = None,
@@ -103,14 +134,14 @@ class PsyRagClient:
             body["depth"] = depth
         if ts is not None:
             body["ts"] = ts
-        return await self._post("/feedback", body)
+        return await self._post_idem("/feedback", body)
 
     async def consolidate(self, ts: Optional[int] = None,
                           apply_conflicts: bool = False) -> dict:
         body: dict[str, Any] = {"apply_conflicts": apply_conflicts}
         if ts is not None:
             body["ts"] = ts
-        return await self._post("/consolidate", body)
+        return await self._post_idem("/consolidate", body)
 
     async def match_nodes(self, tokens: list[str], limit: int = 16) -> list[str]:
         """Resolve free-text tokens to existing node names (substring, case-insensitive)."""

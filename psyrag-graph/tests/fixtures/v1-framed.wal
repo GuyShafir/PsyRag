@@ -1,0 +1,7 @@
+#psyrag-wal:v1 id=e8f4e9762060a6e1
+9a0aec3f:{"op":"observe_node","name":"x","asset_type":"t/x","props":{"k":1},"ts":1000}
+542dad78:{"op":"observe_placeholder","name":"y","inferred_type":"unknown/unknown","ts":1000}
+50943055:{"op":"observe_edge","src":"x","dst":"y","kind":"CALLS","ts":1000}
+f1e412af:{"op":"observe_node","name":"y","asset_type":"t/y","props":null,"ts":1000}
+efa6b0d7:{"op":"observe_placeholder","name":"z","inferred_type":"unknown/unknown","ts":1000}
+7bc7ae88:{"op":"observe_edge","src":"y","dst":"z","kind":"REFS","ts":1000}
