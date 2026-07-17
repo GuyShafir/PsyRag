@@ -8,6 +8,9 @@
 //!   psyrag feedback --seed N... {--used NODE... | --credit name,score... | --reward R [--spread by_activation|uniform]} [--depth D] [--ts MS]
 //!   psyrag consolidate [--ts MS] [--apply-conflicts]
 //!   psyrag stats
+//!   psyrag checkpoint [--no-archive]        (compact the WAL, archive history)
+//!   psyrag verify                           (read-only WAL + sidecar check)
+//!   psyrag backup --out DIR                 (consistent file-copy backup)
 //!   psyrag db {list | create NAME}          (requires --data-dir)
 //!   psyrag serve [--addr HOST:PORT] [--token T] [--read-token T] [--workers N]
 //!                [--max-body-mb N] [--max-open-dbs N]
@@ -30,7 +33,8 @@ use engine::{now_ms, Engine};
 use std::path::Path;
 
 const USAGE: &str = "psyrag <command> [flags]
-commands: config ingest retrieve touch feedback consolidate sleep stats export-bq db serve monitor
+commands: config ingest retrieve touch feedback consolidate sleep stats
+          checkpoint verify backup export-bq db serve monitor
 global:   --wal PATH  --sidecar PATH  --config PATH.json  --data-dir DIR  --db NAME
 run `psyrag config` to see all tunables.";
 
@@ -74,7 +78,7 @@ fn open_engine(a: &Args) -> Result<Engine, String> {
     let cfg = config::load(a.get("config").or(db_cfg.as_deref()))?;
     let pg = PersistentGraph::open(&wal)?;
     let mut layer = PlasticityLayer::new(cfg);
-    layer.load_if_exists(&scp)?;
+    layer.load_if_exists(pg.graph(), &scp)?;
     layer.sync(pg.graph());
     Ok(Engine { pg, layer, sidecar_path: scp, traces: engine::TraceStore::in_memory(4096) })
 }
@@ -113,7 +117,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 e.pg.ingest_entities(&json, t, a.has("reconcile"))?
             };
             e.layer.sync(e.pg.graph());
-            e.layer.save(&e.sidecar_path)?;
+            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
             println!("{}", serde_json::json!({
                 "edges": e.pg.graph().edge_count(),
                 "nodes": e.pg.graph().node_count(),
@@ -134,7 +138,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
             let res = if a.has("adapt") {
                 let mut r = e.layer.retrieve(e.pg.graph(), &seed_refs, d, f, k, t);
                 r.lambda_scale = e.layer.observe(r.mass);
-                e.layer.save(&e.sidecar_path)?;
+                e.layer.save(e.pg.graph(), &e.sidecar_path)?;
                 r
             } else {
                 e.layer.retrieve(e.pg.graph(), &seed_refs, d, f, k, t)
@@ -176,7 +180,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 let used_refs: Vec<&str> = used.iter().map(|s| s.as_str()).collect();
                 e.layer.feedback(e.pg.graph(), &seed_refs, d, f, k, t, &used_refs)
             };
-            e.layer.save(&e.sidecar_path)?;
+            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         Some("touch") => {
@@ -200,7 +204,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 }
             }
             e.layer.touch(&touches, t);
-            e.layer.save(&e.sidecar_path)?;
+            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
             println!("{}", serde_json::json!({"touched": touches.len(), "missed": missed}));
         }
         Some("consolidate") => {
@@ -222,7 +226,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 e.pg.flush()?;
                 e.layer.sync(e.pg.graph());
             }
-            e.layer.save(&e.sidecar_path)?;
+            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "stats": stats, "conflicts": conflicts, "applied_ops": applied
             })).unwrap());
@@ -238,7 +242,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 let g = e.pg.graph();
                 e.layer.sleep(g, t)
             };
-            e.layer.save(&e.sidecar_path)?;
+            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
             println!("{}", serde_json::to_string_pretty(&rep).unwrap());
         }
         Some("export-bq") => {
@@ -251,6 +255,81 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 "out": out, "dataset": dataset,
                 "files": ["nodes.jsonl","edges.jsonl","traces.jsonl","schema.sql","queries.gql","load.sh"]
             }));
+        }
+        Some("checkpoint") => {
+            let mut e = open_engine(a)?;
+            let archive = !a.has("no-archive");
+            let report = e.pg.compact(archive)?;
+            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+            // The serve-mode trace log (if any) references pre-compaction ids.
+            let trace_log = format!("{}.traces.jsonl", e.sidecar_path);
+            let mut traces_cleared = false;
+            if Path::new(&trace_log).exists() {
+                std::fs::write(&trace_log, b"").map_err(|x| x.to_string())?;
+                traces_cleared = true;
+            }
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "report": report, "traces_cleared": traces_cleared,
+            })).unwrap());
+        }
+        Some("verify") => {
+            let (wal, scp, _) = db_paths(a)?;
+            let rep = psyrag_graph::persist::verify_wal(&wal)?;
+            let g = psyrag_graph::persist::replay_readonly(&wal)?;
+            // Sidecar key-match: how many persisted entries resolve to a
+            // current edge (v2 only; v1 is positional by construction).
+            let sidecar_check = if Path::new(&scp).exists() {
+                let mut layer = psyrag_core::PlasticityLayer::new(config::load(a.get("config"))?);
+                match layer.load_if_exists(&g, &scp) {
+                    Ok(()) => serde_json::json!({"loadable": true}),
+                    Err(e) => serde_json::json!({"loadable": false, "error": e}),
+                }
+            } else {
+                serde_json::json!({"loadable": null, "note": "no sidecar file"})
+            };
+            let healthy = rep.corrupt.is_none();
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "wal": rep,
+                "graph": {"nodes": g.node_count(), "edges": g.edge_count()},
+                "sidecar": sidecar_check,
+                "healthy": healthy,
+            })).unwrap());
+            if !healthy {
+                return Err("WAL verification failed (mid-file corruption)".into());
+            }
+        }
+        Some("backup") => {
+            let out = a.get("out").ok_or("--out DIR required")?;
+            let (wal, scp, cfg_path) = db_paths(a)?;
+            // Hold the WAL lock (without replaying) so the copies are a
+            // consistent set; fails fast if a server owns this database.
+            let _lock = psyrag_graph::persist::lock_wal_standalone(&wal)?;
+            std::fs::create_dir_all(out).map_err(|x| x.to_string())?;
+            let mut copied = Vec::new();
+            let trace_log = format!("{scp}.traces.jsonl");
+            let mut sources = vec![wal.clone(), scp.clone(), trace_log];
+            if let Some(c) = cfg_path {
+                sources.push(c);
+            }
+            for src in sources {
+                let p = Path::new(&src);
+                if !p.is_file() {
+                    continue;
+                }
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                let dst = Path::new(out).join(&name);
+                let bytes = std::fs::copy(p, &dst).map_err(|x| format!("copy {src}: {x}"))?;
+                copied.push(serde_json::json!({"file": name, "bytes": bytes}));
+            }
+            let manifest = serde_json::json!({
+                "psyrag_backup": 1, "taken_ms": now_ms(), "source_wal": wal, "files": copied,
+            });
+            std::fs::write(
+                Path::new(out).join("manifest.json"),
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .map_err(|x| x.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
         }
         Some("db") => {
             let root = a.get("data-dir").ok_or("db command requires --data-dir DIR")?;

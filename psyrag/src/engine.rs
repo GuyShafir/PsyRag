@@ -146,6 +146,22 @@ impl TraceStore {
         Ok(())
     }
 
+    /// Drop every stored trace and truncate the durable log. Called after WAL
+    /// compaction: traces hold dense NodeId/EdgeIds, which renumber on the
+    /// next replay. The id counter is NOT reset, so a stale client's old
+    /// trace_id can never silently credit a new, unrelated trace.
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.map.clear();
+        self.order.clear();
+        self.lines = 0;
+        if let Some(path) = &self.path {
+            if std::path::Path::new(path).exists() {
+                std::fs::write(path, b"").map_err(|e| format!("truncate trace log: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn get(&self, id: u64) -> Option<Trace> {
         self.map.get(&id).cloned()
     }

@@ -129,11 +129,104 @@ fn parse_line(s: &str) -> Result<Parsed, String> {
         .map_err(|e| format!("unparseable record: {e}"))
 }
 
+/// Structural verification of a WAL, read-only and lock-free (safe to run
+/// against a live server; it may observe an in-flight torn tail, which is
+/// reported, not failed).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VerifyReport {
+    pub records: usize,
+    pub framed: usize,
+    pub legacy: usize,
+    pub torn_tail: bool,
+    /// First mid-file corrupt line (1-based), with its parse error.
+    pub corrupt: Option<(usize, String)>,
+}
+
+pub fn verify_wal<P: AsRef<Path>>(path: P) -> Result<VerifyReport, String> {
+    let f = File::open(path.as_ref()).map_err(|e| e.to_string())?;
+    let mut rep = VerifyReport {
+        records: 0,
+        framed: 0,
+        legacy: 0,
+        torn_tail: false,
+        corrupt: None,
+    };
+    let mut pending_bad: Option<(usize, String)> = None;
+    let mut line_no = 0usize;
+    for line in BufReader::new(f).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        line_no += 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(bad) = pending_bad.take() {
+            rep.corrupt = Some(bad);
+            return Ok(rep); // mid-file corruption: stop, report
+        }
+        match parse_line(line.trim_end_matches('\r')) {
+            Ok(Parsed::Header) => {}
+            Ok(Parsed::Record(_)) => {
+                rep.records += 1;
+                if line.len() > 9 && line.as_bytes()[8] == b':' {
+                    rep.framed += 1;
+                } else {
+                    rep.legacy += 1;
+                }
+            }
+            Err(e) => pending_bad = Some((line_no, e)),
+        }
+    }
+    rep.torn_tail = pending_bad.is_some();
+    Ok(rep)
+}
+
+/// Replay a WAL into an in-memory graph WITHOUT taking the lock or repairing
+/// the file (torn tail tolerated silently). For inspection/verification only.
+pub fn replay_readonly<P: AsRef<Path>>(path: P) -> Result<TemporalGraph, String> {
+    let f = File::open(path.as_ref()).map_err(|e| e.to_string())?;
+    let mut g = TemporalGraph::new();
+    for line in BufReader::new(f).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(Parsed::Record(op)) = parse_line(line.trim_end_matches('\r')) {
+            g.apply(&op);
+        }
+    }
+    Ok(g)
+}
+
+/// Take the WAL's exclusive lock without replaying it (e.g. to guarantee a
+/// consistent file-copy backup). The lock lives as long as the returned
+/// handle.
+pub fn lock_wal_standalone<P: AsRef<Path>>(path: P) -> Result<File, String> {
+    let path = path.as_ref();
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    try_lock_exclusive(&f, path)?;
+    Ok(f)
+}
+
 pub struct PersistentGraph {
     graph: TemporalGraph,
     wal: BufWriter<File>,
+    path: std::path::PathBuf,
     /// Torn-tail records dropped during replay (0 or 1 with the v1 format).
     pub replay_skipped: usize,
+}
+
+/// What a `compact()` did.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompactReport {
+    pub ops_written: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// Where the pre-compaction log went (None with `archive = false`).
+    pub archive: Option<String>,
 }
 
 impl OpSink for PersistentGraph {
@@ -245,7 +338,133 @@ impl PersistentGraph {
         Ok(Self {
             graph,
             wal,
+            path: path.to_path_buf(),
             replay_skipped,
+        })
+    }
+
+    /// **Checkpoint/compaction**: rewrite the WAL down to the ops that
+    /// reconstruct the graph's *open* state (live node versions, live edges,
+    /// with their original timestamps so `valid_from` is preserved), then
+    /// atomically swap it in. Closed history is dropped from the working log;
+    /// with `archive = true` the old log is kept beside it as
+    /// `<wal>.archive-<ms>` (cold history / a natural backup unit).
+    ///
+    /// Safe against a live process: the new file is created and locked
+    /// *before* any rename, so there is no instant at which another process
+    /// could grab the WAL name. Safe against crashes: every step is
+    /// write-new + rename; the old log is intact until the final rename.
+    ///
+    /// EdgeIds/NodeIds renumber on the next replay — persisted sidecars
+    /// follow via their stable edge keys, but in-memory retrieval traces are
+    /// invalidated (the caller clears its trace store).
+    pub fn compact(&mut self, archive: bool) -> Result<CompactReport, String> {
+        self.flush()?;
+        let bytes_before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+
+        // 1. Synthesize the open-state ops: nodes first (real types), then
+        //    placeholders, then open edges — replay order matters for typing.
+        let g = &self.graph;
+        let mut ops: Vec<Op> = Vec::new();
+        for id in 0..g.node_count() {
+            let n = g.node(id as crate::graph::NodeId);
+            let Some(v) = n.versions.last().filter(|v| v.retired_at == crate::graph::T_MAX) else {
+                continue; // fully retired: drop from the working log
+            };
+            let type_str = g.types.resolve(n.type_id).to_string();
+            if n.placeholder {
+                ops.push(Op::ObservePlaceholder {
+                    name: n.name.clone(),
+                    inferred_type: type_str,
+                    ts: v.observed_at,
+                });
+            } else {
+                ops.push(Op::ObserveNode {
+                    name: n.name.clone(),
+                    asset_type: type_str,
+                    props: v.props_value(),
+                    ts: v.observed_at,
+                });
+            }
+        }
+        for eid in 0..g.edge_count() {
+            let e = g.edge(eid as crate::graph::EdgeId);
+            if e.valid_to != crate::graph::T_MAX {
+                continue; // closed edge: history, dropped
+            }
+            ops.push(Op::ObserveEdge {
+                src: g.node_name(e.src).to_string(),
+                dst: g.node_name(e.dst).to_string(),
+                kind: g.kind_str(e.kind_id).to_string(),
+                ts: e.valid_from,
+            });
+        }
+
+        // 2. Write + lock the replacement before touching the live name.
+        // (Names are appended to the full filename — with_extension would
+        // clobber a ".wal" suffix.)
+        let tmp_path = std::path::PathBuf::from(format!("{}.compact.tmp", self.path.display()));
+        let tmp = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("create {}: {e}", tmp_path.display()))?;
+        try_lock_exclusive(&tmp, &tmp_path)?;
+        let mut w = BufWriter::new(tmp);
+        w.write_all(WAL_HEADER.as_bytes())
+            .and_then(|_| w.write_all(b"\n"))
+            .map_err(|e| e.to_string())?;
+        for op in &ops {
+            let json = serde_json::to_string(op).map_err(|e| e.to_string())?;
+            let line = format!("{:08x}:{}\n", crc32(json.as_bytes()), json);
+            w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        w.flush().map_err(|e| e.to_string())?;
+        w.get_ref().sync_all().map_err(|e| e.to_string())?;
+
+        // 3. Swap: old -> archive (or aside for deletion), tmp -> live name.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let old_dest = std::path::PathBuf::from(if archive {
+            format!("{}.archive-{stamp}", self.path.display())
+        } else {
+            format!("{}.compact.old", self.path.display())
+        });
+        std::fs::rename(&self.path, &old_dest).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp_path, &self.path).map_err(|e| e.to_string())?;
+        if let Some(dir) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        let archive_path = if archive {
+            Some(old_dest.to_string_lossy().into_owned())
+        } else {
+            std::fs::remove_file(&old_dest).map_err(|e| e.to_string())?;
+            None
+        };
+
+        // 4. Adopt the tmp fd itself as our writer: it already holds the
+        //    flock on what is now the live inode, so the lock is continuous —
+        //    there is no instant where the WAL name is open to another
+        //    process. (flock is per open-file-description: re-opening and
+        //    re-locking from this same process would deadlock against `w`.)
+        //    The fd's write position is the end of the file, so sequential
+        //    appends continue correctly without O_APPEND.
+        let f = w
+            .into_inner()
+            .map_err(|e| format!("adopt compacted WAL: {e}"))?;
+        self.wal = BufWriter::new(f);
+
+        let bytes_after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        Ok(CompactReport {
+            ops_written: ops.len(),
+            bytes_before,
+            bytes_after,
+            archive: archive_path,
         })
     }
 

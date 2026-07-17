@@ -81,7 +81,7 @@ pub fn valid_db_name(s: &str) -> bool {
 fn open_engine_at(wal: &str, sidecar: &str, cfg: Config) -> Result<Engine, String> {
     let pg = PersistentGraph::open(wal)?;
     let mut layer = PlasticityLayer::new(cfg);
-    layer.load_if_exists(sidecar)?;
+    layer.load_if_exists(pg.graph(), sidecar)?;
     layer.sync(pg.graph());
     let traces = TraceStore::open(4096, &format!("{sidecar}.traces.jsonl"));
     Ok(Engine {
@@ -214,7 +214,7 @@ impl Registry {
                 eprintln!("psyrag: shutdown flush of db '{name}' WAL failed: {er}");
             }
             let sidecar = e.sidecar_path.clone();
-            if let Err(er) = e.layer.save(&sidecar) {
+            if let Err(er) = e.layer.save(e.pg.graph(), &sidecar) {
                 eprintln!("psyrag: shutdown save of db '{name}' sidecar failed: {er}");
             }
         }
@@ -813,7 +813,7 @@ fn handle_db_write(
             };
             let report = e.layer.apply_credit(e.pg.graph(), &trace, &credit, ts);
             let sidecar = e.sidecar_path.clone();
-            if let Err(msg) = e.layer.save(&sidecar) {
+            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
                 return err(&format!("feedback applied but not persisted: {msg}"), 500);
             }
             json_resp(&report, 200)
@@ -830,10 +830,47 @@ fn handle_db_write(
                 e.layer.sleep(g, ts)
             };
             let sidecar = e.sidecar_path.clone();
-            if let Err(msg) = e.layer.save(&sidecar) {
+            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
                 return err(&format!("sleep ran but not persisted: {msg}"), 500);
             }
             json_resp(&rep, 200)
+        }
+        (Method::Post, "/checkpoint") => {
+            #[derive(Deserialize)]
+            struct CheckpointReq {
+                #[serde(default = "d_true")]
+                archive: bool,
+            }
+            let r: CheckpointReq = if body.trim().is_empty() {
+                CheckpointReq { archive: true }
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(r) => r,
+                    Err(e) => return err(&format!("bad body: {e}"), 400),
+                }
+            };
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            let report = match e.pg.compact(r.archive) {
+                Ok(rep) => rep,
+                Err(msg) => return err(&format!("checkpoint failed: {msg}"), 500),
+            };
+            // Sidecar v2 keys are stable across the renumbering the next
+            // replay performs, so saving against the (old-id) in-memory
+            // graph is correct.
+            let sidecar = e.sidecar_path.clone();
+            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
+                return err(&format!("checkpoint done but sidecar not persisted: {msg}"), 500);
+            }
+            // Outstanding traces reference pre-compaction dense ids.
+            if let Err(msg) = e.traces.clear() {
+                return err(&format!("checkpoint done but trace log not cleared: {msg}"), 500);
+            }
+            json_resp(&serde_json::json!({
+                "report": report,
+                "traces_cleared": true,
+                "note": "in-memory graph keeps full history until restart; the on-disk log is compacted",
+            }), 200)
         }
         (Method::Post, "/consolidate") => {
             let r: ConsolidateReq = if body.trim().is_empty() {
@@ -867,7 +904,7 @@ fn handle_db_write(
                 e.layer.sync(e.pg.graph());
             }
             let sidecar = e.sidecar_path.clone();
-            if let Err(msg) = e.layer.save(&sidecar) {
+            if let Err(msg) = e.layer.save(e.pg.graph(), &sidecar) {
                 return err(&format!("consolidation ran but not persisted: {msg}"), 500);
             }
             json_resp(&serde_json::json!({"stats": stats, "conflicts": conflicts, "applied_ops": applied}), 200)

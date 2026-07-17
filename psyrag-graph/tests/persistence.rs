@@ -165,6 +165,56 @@ fn second_opener_is_refused_while_locked() {
 }
 
 #[test]
+fn compaction_preserves_open_state_and_drops_history() {
+    let path = std::env::temp_dir().join("psyrag_compact.wal");
+    let _ = fs::remove_file(&path);
+    let (report, live_nodes_before, live_edges_before) = {
+        let mut pg = PersistentGraph::open(&path).unwrap();
+        // Two snapshots with churn: subnet-a exists at T1, replaced at T2.
+        pg.ingest_cai_snapshot(&mini_snapshot("img:v1", "subnet-a"), T1).unwrap();
+        pg.ingest_cai_snapshot(&mini_snapshot("img:v2", "subnet-b"), T2).unwrap();
+        let g = pg.graph();
+        let live_nodes = g.alive_at(T2 + 1).len();
+        let live_edges = (0..g.edge_count())
+            .filter(|&e| g.edge(e as u32).alive_at(T2 + 1))
+            .count();
+        let report = pg.compact(true).unwrap();
+        // The compacted log still replays through the SAME handle's appends:
+        pg.record_op(Op::ObserveNode {
+            name: "post-compact".into(),
+            asset_type: "t/x".into(),
+            props: serde_json::Value::Null,
+            ts: T2 + 10,
+        })
+        .unwrap();
+        pg.flush().unwrap();
+        (report, live_nodes, live_edges)
+    };
+    assert!(report.bytes_after < report.bytes_before, "log shrank: {report:?}");
+    let archive = report.archive.clone().expect("archive kept");
+    assert!(std::path::Path::new(&archive).exists());
+
+    // Replay the compacted log: open state identical, history gone.
+    let pg = PersistentGraph::open(&path).unwrap();
+    assert_eq!(pg.replay_skipped, 0);
+    let g = pg.graph();
+    assert_eq!(g.alive_at(T2 + 1).len(), live_nodes_before);
+    let live_edges_after = (0..g.edge_count())
+        .filter(|&e| g.edge(e as u32).alive_at(T2 + 1))
+        .count();
+    assert_eq!(live_edges_after, live_edges_before);
+    // valid_from preserved through compaction (stable-key prerequisite)
+    assert!(g.blast_radius(API, T2 + 1, Direction::Down, 5).iter().any(|r| r.node.contains("subnet-b")));
+    // dropped: subnet-a (retired before compaction) is no longer known at all
+    assert!(g.id_of(&format!("//compute.googleapis.com/projects/p/regions/r/subnetworks/subnet-a")).is_none());
+    // the post-compaction append made it through the adopted fd
+    assert!(g.id_of("post-compact").is_some());
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&archive);
+}
+
+#[test]
 fn legacy_v0_wal_replays_and_mixes_with_framed_appends() {
     let path = std::env::temp_dir().join("psyrag_legacy.wal");
     let _ = fs::remove_file(&path);

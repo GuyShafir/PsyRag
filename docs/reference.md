@@ -28,6 +28,11 @@ own `config.json` > built-in defaults. DB names match `[a-z0-9_-]{1,64}`.
 - Batch boundaries fsync the WAL; sidecar snapshots are written atomically
   (temp + fsync + rename); retrieval traces are fsynced on store. A 2xx from a
   mutating HTTP endpoint means the change is on disk.
+- Sidecar snapshots (v2) key every entry by a **stable edge key** (FNV-1a of
+  `src, dst, kind, valid_from`), so learned weights survive WAL compaction's
+  id renumbering. v1 (positional) sidecars still load.
+- `psyrag checkpoint` / `POST /checkpoint` bound WAL size and replay time;
+  archives hold the dropped history.
 - The WAL is held under an exclusive lock (`flock`): running the CLI against a
   WAL a live `psyrag serve` owns fails fast with a clear error. Use the HTTP
   API against a running server.
@@ -76,6 +81,26 @@ Print sidecar + graph stats as JSON.
 Export the learned graph as BigQuery-ready NDJSON + DDL + GQL + a load script.
 Defaults: `--out ./bq_out`, `--dataset psyrag`. No GCP credentials needed to
 produce the artifacts. See [gcp/README.md](../gcp/README.md).
+
+### `psyrag checkpoint [--no-archive]`
+Compact the WAL down to the ops that reconstruct current open state (live
+nodes/edges keep their original timestamps, so `valid_from` — and with it the
+sidecar's stable edge keys — is preserved). The pre-compaction log is kept as
+`<wal>.archive-<ms>` unless `--no-archive`. Outstanding retrieval traces are
+invalidated (they reference pre-compaction ids). Offline form; against a live
+server use `POST /checkpoint`.
+
+### `psyrag verify`
+Read-only integrity check: WAL structure (framing/CRC per record, torn tail
+vs. mid-file corruption), a full replay (node/edge counts), and sidecar
+loadability. Exits non-zero on corruption. Lock-free — safe against a live
+server (may observe an in-flight tail).
+
+### `psyrag backup --out DIR`
+Consistent file-copy backup of the database (WAL + sidecar + trace log +
+`config.json` if present) plus a `manifest.json`. Takes the WAL lock without
+replaying, so it fails fast if a server owns the database — stop the server
+first or use filesystem snapshots. Restore = copy the files back.
 
 ### `psyrag db {list | create NAME} --data-dir DIR`
 Manage the multi-database layout from the CLI: `list` prints every database
@@ -165,6 +190,12 @@ Provide **one** target and **one** credit spec.
   (graded/contrastive) **or** `"reward": R, "spread": "by_activation"|"uniform"`
   (episodic).
 Returns `{ edges_reinforced, total_positive_r, total_negative_r, hits, misses }`.
+
+### `POST /checkpoint`
+`{ "archive"?: bool }` (default true) → `{ report: { ops_written, bytes_before,
+bytes_after, archive }, traces_cleared, note }`. Compacts this database's WAL
+in place (see `psyrag checkpoint`); the server keeps running and keeps its
+full in-memory history until restart. Stored trace_ids are invalidated.
 
 ### `POST /consolidate`
 `{ "ts"?, "apply_conflicts"?: bool }` → `{ stats, conflicts, applied_ops }`.
