@@ -79,7 +79,7 @@ server or use a filesystem snapshot).
 batch of feedback, or every few minutes — to keep per-source budgets tidy without
 the aggressive downscale.
 
-## Persistence & backup
+## Persistence, checkpointing & backup
 
 Everything learned is three files under the WAL directory:
 
@@ -87,9 +87,19 @@ Everything learned is three files under the WAL directory:
 - `<wal>.psyrag.json` — the plasticity sidecar (weights, decay, homeostat).
 - `<wal>.psyrag.json.traces.jsonl` — the durable trace log.
 
-Back up the directory, or point them at a mounted/managed volume. For a shared or
-multi-region store, back the graph with Spanner and the operational state with
-AlloyDB (see [architecture.md](architecture.md)).
+Operations:
+
+- **Checkpoint** (bound log growth + restart time): `POST /checkpoint`
+  against a live server, or `psyrag checkpoint` offline. Schedule alongside
+  sleep (e.g. nightly). Old logs are archived as `<wal>.archive-<ms>` —
+  rotate them off-box for point-in-time history.
+- **Backup**: `psyrag backup --out DIR` (offline; takes the lock so the copy
+  set is consistent) or snapshot the volume. Restore = copy the files back.
+- **Verify**: `psyrag verify` — CRC sweep, replay, sidecar loadability.
+  Run it after restoring a backup or before trusting a moved data dir.
+
+For a shared or multi-region store, back the graph with Spanner and the
+operational state with AlloyDB (see [architecture.md](architecture.md)).
 
 ## Scaling
 
@@ -128,9 +138,12 @@ Asserts, exiting non-zero on any failure:
 6. consolidation reports,
 7. **sleep** downscales and protects,
 8. **multidb** — isolation between databases + token auth scopes,
-9. **single-writer lock** — the CLI is refused while the server owns the WAL.
+9. **single-writer lock** — the CLI is refused while the server owns the WAL,
+10. **checkpoint** — the WAL shrinks, verifies, and learned salience survives
+    the id renumbering (stable sidecar keys),
+11. **backup** — manifest + consistent file set.
 
-Expected tail: `==== 12 passed, 0 failed ====`.
+Expected tail: `==== 16 passed, 0 failed ====`.
 
 ### Python / ADK
 ```bash

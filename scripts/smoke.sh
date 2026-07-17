@@ -99,6 +99,28 @@ SRV=$!; sleep 1.5
   || ok "CLI refused while server holds the WAL lock"
 kill $SRV 2>/dev/null; sleep 0.5
 
+echo "== 10. checkpoint: log shrinks, learned salience survives replay =="
+# build up version history so there is something for compaction to drop
+for i in 1 2 3; do
+  sed "s/\"type\":\"svc\"/\"type\":\"svc\",\"props\":{\"rev\":$i}/" "$WORK/inv.json" > "$WORK/inv$i.json"
+  "$BIN" --wal "$WAL" ingest --file "$WORK/inv$i.json" --ts $((41000+i*100)) >/dev/null
+done
+BEFORE=$(wc -c < "$WAL" | tr -d ' ')
+CK=$("$BIN" --wal "$WAL" checkpoint)
+AFTER=$(echo "$CK" | j "d['report']['bytes_after']")
+python3 -c "import sys;exit(0 if $AFTER < $BEFORE else 1)" \
+  && ok "checkpoint shrank the WAL ($BEFORE -> $AFTER bytes)" || no "WAL did not shrink"
+"$BIN" --wal "$WAL" verify >/dev/null 2>&1 && ok "compacted WAL verifies" || no "verify failed"
+# the learned dominance from step 4 must survive the id renumbering
+CKW=$("$BIN" --wal "$WAL" retrieve --seed api --depth 1 --top-k 5 --ts 50000 \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);t={x['node']:x['activation'] for x in d['top']};print(1 if t.get('db',0)>t.get('cache',1) else 0)")
+[ "$CKW" = "1" ] && ok "learned weights survive checkpoint (stable keys)" || no "weights lost in checkpoint"
+
+echo "== 11. backup =="
+"$BIN" --wal "$WAL" backup --out "$WORK/bak" >/dev/null \
+  && [ -f "$WORK/bak/manifest.json" ] \
+  && ok "backup wrote manifest + files" || no "backup failed"
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

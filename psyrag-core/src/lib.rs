@@ -999,19 +999,25 @@ impl PlasticityLayer {
     }
 
     /// Serialize the sidecar (weights, last-touch times, per-edge lambda, dead
-    /// mask, homeostat, scale) to JSON. EdgeIds are stable across WAL replay, so
-    /// this composes with the on-disk WAL. Call `sync` after `load` to cover any
-    /// edges appended since the snapshot.
+    /// mask, homeostat, scale) to JSON, format v2: every entry carries a
+    /// **stable edge key** — an FNV-1a hash of `(src, dst, kind, valid_from)` —
+    /// so the snapshot survives WAL compaction/rewrites that renumber the
+    /// dense `EdgeId`s. Call `sync` after `load` to cover any edges appended
+    /// since the snapshot.
     ///
     /// The write is atomic (temp file + fsync + rename): a crash mid-save
     /// leaves the previous snapshot intact, never a truncated one.
-    pub fn save(&self, path: &str) -> Result<(), String> {
+    pub fn save(&self, g: &TemporalGraph, path: &str) -> Result<(), String> {
         use std::io::Write as _;
+        let n = self.w.len().min(g.edge_count());
+        let keys: Vec<u64> = (0..n).map(|i| stable_edge_key(g, i as EdgeId)).collect();
         let p = Persisted {
-            w: &self.w,
-            t_last: &self.t_last,
-            neg_lambda: &self.neg_lambda,
-            dead: &self.dead,
+            psyrag_sidecar: 2,
+            keys,
+            w: &self.w[..n],
+            t_last: &self.t_last[..n],
+            neg_lambda: &self.neg_lambda[..n],
+            dead: &self.dead[..n],
             lambda_scale: self.lambda_scale(),
             homeo: &self.homeo,
         };
@@ -1036,16 +1042,53 @@ impl PlasticityLayer {
     }
 
     /// Load a sidecar snapshot if the file exists (no-op if absent).
-    pub fn load_if_exists(&mut self, path: &str) -> Result<(), String> {
+    ///
+    /// v2 snapshots are resolved by stable edge key against the *current*
+    /// graph — entries follow their edge across WAL compaction; entries whose
+    /// edge no longer exists are dropped; edges with no entry seed fresh
+    /// (as in `sync`). Legacy v1 (keyless, positional) snapshots load
+    /// positionally, which is valid precisely because pre-v2 WALs were never
+    /// compacted.
+    pub fn load_if_exists(&mut self, g: &TemporalGraph, path: &str) -> Result<(), String> {
         if !std::path::Path::new(path).exists() {
             return Ok(());
         }
         let s = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let p: PersistedOwned = serde_json::from_str(&s).map_err(|e| e.to_string())?;
-        self.w = p.w;
-        self.t_last = p.t_last;
-        self.neg_lambda = p.neg_lambda;
-        self.dead = p.dead;
+        match p.keys {
+            Some(keys) => {
+                if keys.len() != p.w.len() {
+                    return Err(format!(
+                        "sidecar {path}: keys/weights length mismatch ({} vs {})",
+                        keys.len(),
+                        p.w.len()
+                    ));
+                }
+                let by_key: HashMap<u64, usize> =
+                    keys.iter().enumerate().map(|(i, &k)| (k, i)).collect();
+                // Seed every current edge fresh, then overlay matched state.
+                self.w.clear();
+                self.t_last.clear();
+                self.neg_lambda.clear();
+                self.dead.clear();
+                self.sync(g);
+                for eid in 0..g.edge_count() {
+                    if let Some(&i) = by_key.get(&stable_edge_key(g, eid as EdgeId)) {
+                        self.w[eid] = p.w[i];
+                        self.t_last[eid] = p.t_last[i];
+                        self.neg_lambda[eid] = p.neg_lambda[i];
+                        self.dead[eid] = p.dead[i];
+                    }
+                }
+            }
+            None => {
+                // v1: positional columns.
+                self.w = p.w;
+                self.t_last = p.t_last;
+                self.neg_lambda = p.neg_lambda;
+                self.dead = p.dead;
+            }
+        }
         self.set_lambda_scale(p.lambda_scale);
         self.homeo = p.homeo;
         Ok(())
@@ -1065,9 +1108,39 @@ impl PlasticityLayer {
     }
 }
 
-// Borrowed view for zero-copy save; owned mirror for load.
+/// Stable, process-independent identity of an edge: FNV-1a 64 over
+/// `src \0 dst \0 kind \0 valid_from`. Dense `EdgeId`s renumber whenever the
+/// WAL is compacted; this key follows the fact itself (`valid_from` is
+/// preserved by compaction, and distinguishes re-observations of the same
+/// triple). Collisions at realistic edge counts are ~2^-64-scale noise; a
+/// collision merely makes two edges share persisted salience state.
+pub fn stable_edge_key(g: &TemporalGraph, eid: EdgeId) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let e = g.edge(eid);
+    let mut h = FNV_OFFSET;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    eat(g.node_name(e.src).as_bytes());
+    eat(&[0]);
+    eat(g.node_name(e.dst).as_bytes());
+    eat(&[0]);
+    eat(g.kind_str(e.kind_id).as_bytes());
+    eat(&[0]);
+    eat(&e.valid_from.to_le_bytes());
+    h
+}
+
+// Borrowed view for zero-copy save; owned mirror for load. `keys` (v2) maps
+// each column entry to its stable edge key; absent = legacy v1 positional.
 #[derive(Serialize)]
 struct Persisted<'a> {
+    psyrag_sidecar: u32,
+    keys: Vec<u64>,
     w: &'a [f32],
     t_last: &'a [Ts],
     neg_lambda: &'a [f32],
@@ -1077,6 +1150,11 @@ struct Persisted<'a> {
 }
 #[derive(Deserialize)]
 struct PersistedOwned {
+    #[serde(default)]
+    #[allow(dead_code)]
+    psyrag_sidecar: u32,
+    #[serde(default)]
+    keys: Option<Vec<u64>>,
     w: Vec<f32>,
     t_last: Vec<Ts>,
     neg_lambda: Vec<f32>,
@@ -1314,6 +1392,93 @@ mod tests {
         assert!(p.effective_weight(ha, 100 * S) > 0.0, "consolidated edge survives");
         assert!(p.effective_weight(he, 100 * S) == 0.0, "weak edge pruned in sleep");
         assert!(rep.protected >= 1 && rep.pruned >= 1);
+    }
+
+    #[test]
+    fn sidecar_v2_roundtrip_restores_state() {
+        let g = seed_graph();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg.clone());
+        p.sync(&g);
+        let ha = p.edge_id(&g, "hub", "a", "CALLS").unwrap();
+        p.touch(&[(ha, 1.0)], 5 * S);
+        let w_before = p.effective_weight(ha, 5 * S);
+        let path = std::env::temp_dir().join("psyrag_sc_v2.json");
+        let path = path.to_str().unwrap();
+        p.save(&g, path).unwrap();
+        let mut q = PlasticityLayer::new(cfg);
+        q.load_if_exists(&g, path).unwrap();
+        q.sync(&g);
+        assert!((q.effective_weight(ha, 5 * S) - w_before).abs() < 1e-6);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidecar_v2_survives_edge_renumbering() {
+        // Save against a graph with edges [x->gone, x->keep]; reload against a
+        // "compacted" graph where `gone` was dropped, so keep's EdgeId shifts
+        // from 1 to 0. The learned weight must follow the edge, not the index.
+        let json_full = r#"[{"name":"x","type":"t","edges":[
+            {"dst":"gone","kind":"CALLS"},{"dst":"keep","kind":"CALLS"}]}]"#;
+        let mut g1 = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g1, json_full, 0, false).unwrap();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg.clone());
+        p.sync(&g1);
+        let keep1 = p.edge_id(&g1, "x", "keep", "CALLS").unwrap();
+        assert_eq!(keep1, 1, "test setup: keep is the second edge");
+        p.touch(&[(keep1, 1.0)], 1 * S);
+        let w_learned = p.effective_weight(keep1, 1 * S);
+        let path = std::env::temp_dir().join("psyrag_sc_renum.json");
+        let path = path.to_str().unwrap();
+        p.save(&g1, path).unwrap();
+
+        // Compacted world: only the open x->keep edge (same valid_from=0).
+        let json_compact = r#"[{"name":"x","type":"t","edges":[
+            {"dst":"keep","kind":"CALLS"}]}]"#;
+        let mut g2 = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g2, json_compact, 0, false).unwrap();
+        let mut q = PlasticityLayer::new(cfg);
+        q.load_if_exists(&g2, path).unwrap();
+        q.sync(&g2);
+        let keep2 = q.edge_id(&g2, "x", "keep", "CALLS").unwrap();
+        assert_eq!(keep2, 0, "renumbered after compaction");
+        assert!(
+            (q.effective_weight(keep2, 1 * S) - w_learned).abs() < 1e-6,
+            "state followed the stable key across renumbering"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidecar_v1_legacy_loads_positionally() {
+        let g = seed_graph();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg.clone());
+        p.sync(&g);
+        let n = g.edge_count();
+        // Hand-craft a v1 (keyless) snapshot: edge 0 carries weight 0.77.
+        let mut w = vec![0.5f32; n];
+        w[0] = 0.77;
+        let v1 = serde_json::json!({
+            "w": w,
+            "t_last": vec![0i64; n],
+            "neg_lambda": vec![0.0f32; n],
+            "dead": vec![false; n],
+            "lambda_scale": 1.0,
+            "homeo": serde_json::to_value(&p.homeo).unwrap(),
+        });
+        let path = std::env::temp_dir().join("psyrag_sc_v1.json");
+        let path = path.to_str().unwrap();
+        std::fs::write(path, v1.to_string()).unwrap();
+        let mut q = PlasticityLayer::new(cfg);
+        q.load_if_exists(&g, path).unwrap();
+        q.sync(&g);
+        assert!((q.effective_weight(0, 1 * S) - 0.77).abs() < 1e-6);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
