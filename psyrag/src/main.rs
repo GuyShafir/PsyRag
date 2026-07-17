@@ -8,9 +8,12 @@
 //!   psyrag feedback --seed N... {--used NODE... | --credit name,score... | --reward R [--spread by_activation|uniform]} [--depth D] [--ts MS]
 //!   psyrag consolidate [--ts MS] [--apply-conflicts]
 //!   psyrag stats
-//!   psyrag serve [--addr HOST:PORT]
+//!   psyrag db {list | create NAME}          (requires --data-dir)
+//!   psyrag serve [--addr HOST:PORT] [--token T] [--read-token T] [--workers N]
+//!                [--max-body-mb N] [--max-open-dbs N]
 //!   psyrag monitor [--url URL] [--interval-ms N]
 //! Global: --wal PATH  --sidecar PATH  --config PATH.json
+//!         --data-dir DIR  --db NAME     (multi-database layout)
 
 mod args;
 mod config;
@@ -24,23 +27,52 @@ use args::Args;
 use psyrag_graph::PersistentGraph;
 use psyrag_core::PlasticityLayer;
 use engine::{now_ms, Engine};
+use std::path::Path;
 
 const USAGE: &str = "psyrag <command> [flags]
-commands: config ingest retrieve touch feedback consolidate sleep stats export-bq serve monitor
-global:   --wal PATH  --sidecar PATH  --config PATH.json
+commands: config ingest retrieve touch feedback consolidate sleep stats export-bq db serve monitor
+global:   --wal PATH  --sidecar PATH  --config PATH.json  --data-dir DIR  --db NAME
 run `psyrag config` to see all tunables.";
 
-fn sidecar_path(a: &Args) -> String {
-    a.get("sidecar")
-        .map(String::from)
-        .unwrap_or_else(|| format!("{}.psyrag.json", a.get_or("wal", "psyrag.wal")))
+/// Resolve the (wal, sidecar, per-db-config) paths for the addressed
+/// database. `--data-dir DIR [--db NAME]` selects the multi-DB layout
+/// `DIR/NAME/{wal,sidecar.json,config.json}`; otherwise the legacy
+/// `--wal`/`--sidecar` flags address a single default database.
+fn db_paths(a: &Args) -> Result<(String, String, Option<String>), String> {
+    match a.get("data-dir") {
+        Some(root) => {
+            let db = a.get_or("db", serve::DEFAULT_DB);
+            if !serve::valid_db_name(db) {
+                return Err(format!("invalid --db '{db}' (want [a-z0-9_-]{{1,64}})"));
+            }
+            let dir = Path::new(root).join(db);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+            let cfg = dir.join("config.json");
+            Ok((
+                dir.join("wal").to_string_lossy().into_owned(),
+                dir.join("sidecar.json").to_string_lossy().into_owned(),
+                cfg.is_file().then(|| cfg.to_string_lossy().into_owned()),
+            ))
+        }
+        None => {
+            if a.get("db").is_some() {
+                return Err("--db requires --data-dir (multi-database layout)".into());
+            }
+            let wal = a.get_or("wal", "psyrag.wal").to_string();
+            let sidecar = a
+                .get("sidecar")
+                .map(String::from)
+                .unwrap_or_else(|| format!("{wal}.psyrag.json"));
+            Ok((wal, sidecar, None))
+        }
+    }
 }
 
 fn open_engine(a: &Args) -> Result<Engine, String> {
-    let cfg = config::load(a.get("config"))?;
-    let wal = a.get_or("wal", "psyrag.wal");
-    let pg = PersistentGraph::open(wal)?;
-    let scp = sidecar_path(a);
+    let (wal, scp, db_cfg) = db_paths(a)?;
+    // Config precedence: explicit --config > the db's config.json > defaults.
+    let cfg = config::load(a.get("config").or(db_cfg.as_deref()))?;
+    let pg = PersistentGraph::open(&wal)?;
     let mut layer = PlasticityLayer::new(cfg);
     layer.load_if_exists(&scp)?;
     layer.sync(pg.graph());
@@ -220,11 +252,80 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 "files": ["nodes.jsonl","edges.jsonl","traces.jsonl","schema.sql","queries.gql","load.sh"]
             }));
         }
+        Some("db") => {
+            let root = a.get("data-dir").ok_or("db command requires --data-dir DIR")?;
+            match a.positionals.get(1).map(|s| s.as_str()) {
+                Some("list") => {
+                    let mut rows = Vec::new();
+                    if let Ok(rd) = std::fs::read_dir(root) {
+                        for e in rd.filter_map(|e| e.ok()) {
+                            if !e.path().is_dir() {
+                                continue;
+                            }
+                            let name = e.file_name().to_string_lossy().into_owned();
+                            if !serve::valid_db_name(&name) {
+                                continue;
+                            }
+                            let wal_len = std::fs::metadata(e.path().join("wal"))
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            rows.push(serde_json::json!({
+                                "db": name,
+                                "wal_bytes": wal_len,
+                                "has_config": e.path().join("config.json").is_file(),
+                            }));
+                        }
+                    }
+                    rows.sort_by(|x, y| x["db"].as_str().cmp(&y["db"].as_str()));
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({"dbs": rows})).unwrap());
+                }
+                Some("create") => {
+                    let name = a
+                        .positionals
+                        .get(2)
+                        .ok_or("usage: psyrag db create NAME --data-dir DIR")?;
+                    if !serve::valid_db_name(name) {
+                        return Err(format!("invalid db name '{name}' (want [a-z0-9_-]{{1,64}})"));
+                    }
+                    let dir = Path::new(root).join(name);
+                    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    println!("{}", serde_json::json!({"created": name, "dir": dir.display().to_string()}));
+                }
+                _ => return Err("usage: psyrag db {list | create NAME} --data-dir DIR".into()),
+            }
+        }
         Some("serve") => {
             let cfg = config::load(a.get("config"))?;
-            let addr = a.get_or("addr", "0.0.0.0:8080").to_string();
+            // Loopback by default: exposing the store is an explicit choice
+            // (pair a public bind with --token).
+            let addr = a.get_or("addr", "127.0.0.1:8080").to_string();
             let wal = a.get_or("wal", "psyrag.wal").to_string();
-            serve::run(&addr, &wal, &sidecar_path(a), cfg)?;
+            let sidecar = a
+                .get("sidecar")
+                .map(String::from)
+                .unwrap_or_else(|| format!("{wal}.psyrag.json"));
+            let workers = a.get_usize("workers").unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4)
+            });
+            let opts = serve::ServeOpts {
+                addr,
+                data_dir: a.get("data-dir").map(std::path::PathBuf::from),
+                wal,
+                sidecar,
+                cfg,
+                token: a
+                    .get("token")
+                    .map(String::from)
+                    .or_else(|| std::env::var("PSYRAG_TOKEN").ok()),
+                read_token: a
+                    .get("read-token")
+                    .map(String::from)
+                    .or_else(|| std::env::var("PSYRAG_READ_TOKEN").ok()),
+                max_body: a.get_usize("max-body-mb").unwrap_or(32) * 1024 * 1024,
+                workers,
+                max_open_dbs: a.get_usize("max-open-dbs").unwrap_or(64),
+            };
+            serve::run(opts)?;
         }
         Some("monitor") => {
             let url = a.get_or("url", "http://127.0.0.1:8080").to_string();

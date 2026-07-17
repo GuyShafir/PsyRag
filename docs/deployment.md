@@ -28,11 +28,50 @@ curl -s -X POST localhost:8080/ingest -H 'content-type: application/json' \
 open http://localhost:8080/     # the console
 ```
 
+## Security
+
+The server binds `127.0.0.1` by default. To expose it:
+
+```bash
+psyrag serve --addr 0.0.0.0:8080 --token "$ADMIN_TOKEN" --read-token "$VIEWER_TOKEN"
+```
+
+- `--token` (or `$PSYRAG_TOKEN`) — full read/write access via
+  `Authorization: Bearer`.
+- `--read-token` (or `$PSYRAG_READ_TOKEN`) — read endpoints only (retrieval
+  must pass `adapt=false, trace=false`).
+- Without a token the server runs in open mode and warns on non-loopback
+  binds. `DELETE /db/{name}` is disabled entirely in open mode.
+- TLS: terminate at a reverse proxy (nginx/Caddy/Cloud Run); the server
+  speaks plain HTTP.
+
+## Multi-database (isolation)
+
+One server can host many fully isolated databases (per tenant, per agent,
+per environment):
+
+```bash
+psyrag --data-dir /data/dbs serve --addr 127.0.0.1:8080
+curl -X POST localhost:8080/db/tenant-a          # create
+curl -X POST localhost:8080/db/tenant-a/ingest -d @...   # use
+curl localhost:8080/dbs                          # list
+```
+
+Each DB is a directory `/data/dbs/<name>/{wal,sidecar.json,config.json}` with
+its own lock and its own `RwLock` — one DB's ingest or sleep never blocks
+another DB's retrieval. A DB with a `config.json` overrides the server-wide
+plasticity config. Bare routes (`/retrieve`, …) address the `default` DB, so
+single-DB clients work unchanged. `--max-open-dbs` caps resident DBs
+(LRU-evicting idle ones); back up a DB by copying its directory (stop the
+server or use a filesystem snapshot).
+
 ## Scheduling sleep
 
 `sleep` is an offline batch op, not on the retrieval path. Run it on a schedule:
 
-- **Cron / systemd timer**: `psyrag --wal /data/mem.wal sleep` nightly.
+- **Cron / systemd timer**: `curl -X POST localhost:8080/sleep` nightly against
+  the running server. (The CLI form `psyrag --wal … sleep` only works when no
+  server holds the WAL — the single-writer lock will refuse it otherwise.)
 - **GCP**: Cloud Scheduler → a Cloud Run job invoking `POST /sleep` (or the CLI in
   a one-shot container). Once per night, or per-N episodes for high-traffic agents.
 
@@ -59,8 +98,10 @@ AlloyDB (see [architecture.md](architecture.md)).
 - **Tiered** (page-in or server-side neighborhood over Spanner) when the graph
   outgrows one machine or must be shared. The `GraphBackend` seam is the insertion
   point; the boundary is per-query, never per-edge.
-- Retrieval is read-only and lock-light; the server serializes mutations
-  (ingest / feedback / consolidate / sleep) behind a single lock.
+- The server runs a worker-thread pool; reads (plain retrieval, stats, match,
+  graph) share a read lock per database, mutations take that database's write
+  lock. Databases are independent — mutations in one never block reads in
+  another.
 
 ## Testing
 
@@ -85,9 +126,11 @@ Asserts, exiting non-zero on any failure:
 5. **durable trace survives restart** — a trace issued before a kill is still
    creditable by a fresh process,
 6. consolidation reports,
-7. **sleep** downscales and protects.
+7. **sleep** downscales and protects,
+8. **multidb** — isolation between databases + token auth scopes,
+9. **single-writer lock** — the CLI is refused while the server owns the WAL.
 
-Expected tail: `==== 7 passed, 0 failed ====`.
+Expected tail: `==== 12 passed, 0 failed ====`.
 
 ### Python / ADK
 ```bash
