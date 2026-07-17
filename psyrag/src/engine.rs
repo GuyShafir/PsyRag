@@ -15,6 +15,30 @@ pub struct Engine {
     pub layer: PlasticityLayer,
     pub sidecar_path: String,
     pub traces: TraceStore,
+    /// Set when a WAL write/flush failed AFTER ops were applied in memory:
+    /// memory and disk have diverged and we cannot un-apply. The database
+    /// stays readable but refuses further writes until restart (which
+    /// replays only what the WAL acked). Holds the original error.
+    pub wedged: Option<String>,
+}
+
+impl Engine {
+    /// Persist the sidecar stamped with the WAL epoch it is as-of
+    /// (wal_id + LSN). All sidecar saves go through here so the binding
+    /// can never be forgotten.
+    pub fn save_sidecar(&mut self) -> Result<(), String> {
+        let lsn = self.pg.lsn();
+        let id = self.pg.wal_id().map(|s| s.to_string());
+        self.layer.set_wal_binding(id.as_deref(), lsn);
+        self.layer.save(self.pg.graph(), &self.sidecar_path)
+    }
+
+    /// Record a WAL-write failure: wedge the database read-only.
+    pub fn wedge(&mut self, err: &str) {
+        if self.wedged.is_none() {
+            self.wedged = Some(err.to_string());
+        }
+    }
 }
 
 /// Wall-clock millis, ratcheted monotonic: a backwards clock jump (NTP step,

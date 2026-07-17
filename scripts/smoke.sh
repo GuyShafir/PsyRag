@@ -121,6 +121,19 @@ echo "== 11. backup =="
   && [ -f "$WORK/bak/manifest.json" ] \
   && ok "backup wrote manifest + files" || no "backup failed"
 
+echo "== 12. idempotent retry (same key never double-applies) =="
+"$BIN" --wal "$WAL" serve --addr "127.0.0.1:${PORT}" >"$WORK/serve4.log" 2>&1 &
+SRV=$!; sleep 1.5
+IH='Idempotency-Key: smoke-idem-1'
+F1=$(curl -s -H "$IH" -X POST "$URL/feedback" -H 'Content-Type: application/json' \
+     -d '{"seeds":["api"],"used":["db"],"ts":60000}')
+F2=$(curl -sD "$WORK/idem.hdr" -H "$IH" -X POST "$URL/feedback" -H 'Content-Type: application/json' \
+     -d '{"seeds":["api"],"used":["db"],"ts":60000}')
+[ "$F1" = "$F2" ] && ok "retry returned the identical response" || no "responses differ: $F1 vs $F2"
+grep -qi "idempotency-replayed: true" "$WORK/idem.hdr" \
+  && ok "retry was served from the replay cache" || no "no replay marker on retry"
+kill $SRV 2>/dev/null; sleep 0.5
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

@@ -354,6 +354,13 @@ pub struct PlasticityLayer {
     dead: Vec<bool>,
 
     lambda_scale: AtomicU32,
+
+    /// WAL binding stamped into saves: (wal lineage id, LSN as-of). Set by
+    /// the engine before each save; None = unbound (tests, legacy).
+    wal_binding: Option<(String, u64)>,
+    /// The (wal_id, lsn) the last loaded snapshot was saved at, for
+    /// verify-style reporting of the learning gap.
+    pub loaded_binding: Option<(String, u64)>,
 }
 
 impl PlasticityLayer {
@@ -367,7 +374,18 @@ impl PlasticityLayer {
             neg_lambda: Vec::new(),
             dead: Vec::new(),
             lambda_scale: AtomicU32::new(1.0f32.to_bits()),
+            wal_binding: None,
+            loaded_binding: None,
         }
+    }
+
+    /// Bind subsequent saves to a WAL epoch: snapshots record which log (and
+    /// how far into it) the learned state corresponds to. Touches/feedback
+    /// are NOT journaled, so learning past a snapshot's LSN is lost on
+    /// crash — the binding makes that gap detectable and reportable instead
+    /// of silent.
+    pub fn set_wal_binding(&mut self, wal_id: Option<&str>, lsn: u64) {
+        self.wal_binding = wal_id.map(|id| (id.to_string(), lsn));
     }
 
     #[inline]
@@ -1013,6 +1031,8 @@ impl PlasticityLayer {
         let keys: Vec<u64> = (0..n).map(|i| stable_edge_key(g, i as EdgeId)).collect();
         let p = Persisted {
             psyrag_sidecar: 2,
+            wal_id: self.wal_binding.as_ref().map(|(id, _)| id.as_str()),
+            wal_lsn: self.wal_binding.as_ref().map(|(_, l)| *l),
             keys,
             w: &self.w[..n],
             t_last: &self.t_last[..n],
@@ -1055,6 +1075,25 @@ impl PlasticityLayer {
         }
         let s = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let p: PersistedOwned = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+        if p.psyrag_sidecar > 2 {
+            return Err(format!(
+                "sidecar {path} is format v{}, newer than this binary understands (max v2) —                  upgrade psyrag or restore the pre-upgrade backup",
+                p.psyrag_sidecar
+            ));
+        }
+        // A sidecar bound to a DIFFERENT WAL lineage is a copy/restore
+        // mistake: refuse loudly rather than let stable keys silently
+        // cross-pollinate two databases that happen to share edge names.
+        if let (Some(ours), Some((theirs, _))) =
+            (&p.wal_id, self.wal_binding.as_ref())
+        {
+            if ours != theirs {
+                return Err(format!(
+                    "sidecar {path} belongs to WAL {ours}, not this WAL {theirs} —                      wrong file? (delete it to start learning fresh)"
+                ));
+            }
+        }
+        self.loaded_binding = p.wal_id.clone().zip(p.wal_lsn);
         match p.keys {
             Some(keys) => {
                 if keys.len() != p.w.len() {
@@ -1140,6 +1179,8 @@ pub fn stable_edge_key(g: &TemporalGraph, eid: EdgeId) -> u64 {
 #[derive(Serialize)]
 struct Persisted<'a> {
     psyrag_sidecar: u32,
+    wal_id: Option<&'a str>,
+    wal_lsn: Option<u64>,
     keys: Vec<u64>,
     w: &'a [f32],
     t_last: &'a [Ts],
@@ -1151,8 +1192,11 @@ struct Persisted<'a> {
 #[derive(Deserialize)]
 struct PersistedOwned {
     #[serde(default)]
-    #[allow(dead_code)]
     psyrag_sidecar: u32,
+    #[serde(default)]
+    wal_id: Option<String>,
+    #[serde(default)]
+    wal_lsn: Option<u64>,
     #[serde(default)]
     keys: Option<Vec<u64>>,
     w: Vec<f32>,

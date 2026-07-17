@@ -78,9 +78,11 @@ fn open_engine(a: &Args) -> Result<Engine, String> {
     let cfg = config::load(a.get("config").or(db_cfg.as_deref()))?;
     let pg = PersistentGraph::open(&wal)?;
     let mut layer = PlasticityLayer::new(cfg);
+    // Bind BEFORE load so a sidecar from a different WAL is refused loudly.
+    layer.set_wal_binding(pg.wal_id(), pg.lsn());
     layer.load_if_exists(pg.graph(), &scp)?;
     layer.sync(pg.graph());
-    Ok(Engine { pg, layer, sidecar_path: scp, traces: engine::TraceStore::in_memory(4096) })
+    Ok(Engine { pg, layer, sidecar_path: scp, traces: engine::TraceStore::in_memory(4096), wedged: None })
 }
 
 fn main() {
@@ -117,7 +119,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 e.pg.ingest_entities(&json, t, a.has("reconcile"))?
             };
             e.layer.sync(e.pg.graph());
-            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+            e.save_sidecar()?;
             println!("{}", serde_json::json!({
                 "edges": e.pg.graph().edge_count(),
                 "nodes": e.pg.graph().node_count(),
@@ -138,7 +140,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
             let res = if a.has("adapt") {
                 let mut r = e.layer.retrieve(e.pg.graph(), &seed_refs, d, f, k, t);
                 r.lambda_scale = e.layer.observe(r.mass);
-                e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+                e.save_sidecar()?;
                 r
             } else {
                 e.layer.retrieve(e.pg.graph(), &seed_refs, d, f, k, t)
@@ -180,7 +182,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 let used_refs: Vec<&str> = used.iter().map(|s| s.as_str()).collect();
                 e.layer.feedback(e.pg.graph(), &seed_refs, d, f, k, t, &used_refs)
             };
-            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+            e.save_sidecar()?;
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         Some("touch") => {
@@ -204,7 +206,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 }
             }
             e.layer.touch(&touches, t);
-            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+            e.save_sidecar()?;
             println!("{}", serde_json::json!({"touched": touches.len(), "missed": missed}));
         }
         Some("consolidate") => {
@@ -226,7 +228,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 e.pg.flush()?;
                 e.layer.sync(e.pg.graph());
             }
-            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+            e.save_sidecar()?;
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "stats": stats, "conflicts": conflicts, "applied_ops": applied
             })).unwrap());
@@ -242,7 +244,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 let g = e.pg.graph();
                 e.layer.sleep(g, t)
             };
-            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+            e.save_sidecar()?;
             println!("{}", serde_json::to_string_pretty(&rep).unwrap());
         }
         Some("export-bq") => {
@@ -260,7 +262,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
             let mut e = open_engine(a)?;
             let archive = !a.has("no-archive");
             let report = e.pg.compact(archive)?;
-            e.layer.save(e.pg.graph(), &e.sidecar_path)?;
+            e.save_sidecar()?;
             // The serve-mode trace log (if any) references pre-compaction ids.
             let trace_log = format!("{}.traces.jsonl", e.sidecar_path);
             let mut traces_cleared = false;
@@ -276,12 +278,27 @@ fn dispatch(a: &Args) -> Result<(), String> {
             let (wal, scp, _) = db_paths(a)?;
             let rep = psyrag_graph::persist::verify_wal(&wal)?;
             let g = psyrag_graph::persist::replay_readonly(&wal)?;
-            // Sidecar key-match: how many persisted entries resolve to a
-            // current edge (v2 only; v1 is positional by construction).
+            // Sidecar checks: loadability, WAL-lineage binding, and the
+            // learning gap (touches/feedback are not journaled, so learning
+            // applied after the sidecar's LSN is lost on crash — report it).
             let sidecar_check = if Path::new(&scp).exists() {
                 let mut layer = psyrag_core::PlasticityLayer::new(config::load(a.get("config"))?);
+                layer.set_wal_binding(rep.wal_id.as_deref(), rep.records as u64);
                 match layer.load_if_exists(&g, &scp) {
-                    Ok(()) => serde_json::json!({"loadable": true}),
+                    Ok(()) => {
+                        let (bound_id, bound_lsn) = match &layer.loaded_binding {
+                            Some((id, lsn)) => (Some(id.clone()), Some(*lsn)),
+                            None => (None, None),
+                        };
+                        let gap = bound_lsn.map(|l| (rep.records as u64).saturating_sub(l));
+                        serde_json::json!({
+                            "loadable": true,
+                            "bound_wal_id": bound_id,
+                            "as_of_lsn": bound_lsn,
+                            "wal_lsn": rep.records,
+                            "learning_gap_ops": gap,
+                        })
+                    }
                     Err(e) => serde_json::json!({"loadable": false, "error": e}),
                 }
             } else {

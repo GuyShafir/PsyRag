@@ -1,0 +1,1 @@
+{"psyrag_sidecar":9,"keys":[],"w":[],"t_last":[],"neg_lambda":[],"dead":[],"lambda_scale":1.0,"homeo":{"setpoint":0.5,"k_i":0.02,"integral":0.0,"ewma_mass":0.0,"ewma_beta":0.8,"scale_min":0.25,"scale_max":8.0,"i_min":-500.0,"i_max":500.0,"primed":false}}

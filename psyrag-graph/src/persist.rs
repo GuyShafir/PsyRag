@@ -38,6 +38,41 @@ use std::path::Path;
 
 const WAL_HEADER: &str = "#psyrag-wal:v1";
 
+/// Generate a WAL identity for a new log: hex of FNV-1a over (nanos, pid).
+/// Not cryptographic — it only needs to distinguish one WAL lineage from
+/// another so a sidecar copied next to the wrong WAL is caught loudly.
+fn new_wal_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in nanos.to_le_bytes().iter().chain(pid.to_le_bytes().iter()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Extract ` id=<hex>` from a `#psyrag-wal:...` header line.
+fn parse_header_id(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix("id=").map(String::from))
+}
+
+/// Extract the format version from a `#psyrag-wal:vN ...` header line.
+fn parse_header_version(line: &str) -> Option<u32> {
+    line.strip_prefix("#psyrag-wal:v")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// The newest WAL format this binary understands. A header with a higher
+/// version refuses to open: after a rollback, "refuse loudly" beats
+/// half-reading a future format.
+const WAL_VERSION_MAX: u32 = 1;
+
 /// IEEE CRC32 (the zlib/PNG polynomial), table-based. Kept in-crate to hold
 /// the zero-dependency line.
 pub fn crc32(data: &[u8]) -> u32 {
@@ -134,6 +169,7 @@ fn parse_line(s: &str) -> Result<Parsed, String> {
 /// reported, not failed).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct VerifyReport {
+    pub wal_id: Option<String>,
     pub records: usize,
     pub framed: usize,
     pub legacy: usize,
@@ -145,6 +181,7 @@ pub struct VerifyReport {
 pub fn verify_wal<P: AsRef<Path>>(path: P) -> Result<VerifyReport, String> {
     let f = File::open(path.as_ref()).map_err(|e| e.to_string())?;
     let mut rep = VerifyReport {
+        wal_id: None,
         records: 0,
         framed: 0,
         legacy: 0,
@@ -164,7 +201,11 @@ pub fn verify_wal<P: AsRef<Path>>(path: P) -> Result<VerifyReport, String> {
             return Ok(rep); // mid-file corruption: stop, report
         }
         match parse_line(line.trim_end_matches('\r')) {
-            Ok(Parsed::Header) => {}
+            Ok(Parsed::Header) => {
+                if rep.wal_id.is_none() {
+                    rep.wal_id = parse_header_id(line.trim_end_matches('\r'));
+                }
+            }
             Ok(Parsed::Record(_)) => {
                 rep.records += 1;
                 if line.len() > 9 && line.as_bytes()[8] == b':' {
@@ -215,6 +256,12 @@ pub struct PersistentGraph {
     graph: TemporalGraph,
     wal: BufWriter<File>,
     path: std::path::PathBuf,
+    /// Identity of this WAL lineage (from the header; survives compaction).
+    /// None for headerless legacy logs.
+    wal_id: Option<String>,
+    /// Log sequence number: ops replayed + ops appended. A sidecar stamped
+    /// with (wal_id, lsn) is "as of" that point in this log.
+    lsn: u64,
     /// Torn-tail records dropped during replay (0 or 1 with the v1 format).
     pub replay_skipped: usize,
 }
@@ -237,6 +284,7 @@ impl OpSink for PersistentGraph {
             .write_all(line.as_bytes())
             .map_err(|e| e.to_string())?;
         self.graph.apply(&op);
+        self.lsn += 1;
         Ok(())
     }
     fn graph(&self) -> &TemporalGraph {
@@ -262,6 +310,8 @@ impl PersistentGraph {
 
         let mut graph = TemporalGraph::new();
         let mut replay_skipped = 0usize;
+        let mut lsn: u64 = 0;
+        let mut wal_id: Option<String> = None;
         // Deferred verdict on the most recent bad line: only the FINAL line of
         // the file may be bad (torn tail). (offset, line_no, error)
         let mut pending_bad: Option<(u64, usize, String)> = None;
@@ -305,10 +355,22 @@ impl PersistentGraph {
                 needs_newline = false;
                 match parse_line(content) {
                     Ok(Parsed::Header) => {
+                        if let Some(v) = parse_header_version(content) {
+                            if v > WAL_VERSION_MAX {
+                                return Err(format!(
+                                    "WAL {} is format v{v}, newer than this binary understands                                      (max v{WAL_VERSION_MAX}) — upgrade psyrag or restore the                                      pre-upgrade backup",
+                                    path.display()
+                                ));
+                            }
+                        }
+                        if wal_id.is_none() {
+                            wal_id = parse_header_id(content);
+                        }
                         needs_newline = !line.ends_with('\n');
                     }
                     Ok(Parsed::Record(op)) => {
                         graph.apply(&op);
+                        lsn += 1;
                         needs_newline = !line.ends_with('\n');
                     }
                     Err(e) => pending_bad = Some((start, line_no, e)),
@@ -331,14 +393,17 @@ impl PersistentGraph {
             wal.write_all(b"\n").map_err(|e| e.to_string())?;
         }
         if is_empty {
-            wal.write_all(WAL_HEADER.as_bytes())
-                .and_then(|_| wal.write_all(b"\n"))
+            let id = new_wal_id();
+            wal.write_all(format!("{WAL_HEADER} id={id}\n").as_bytes())
                 .map_err(|e| e.to_string())?;
+            wal_id = Some(id);
         }
         Ok(Self {
             graph,
             wal,
             path: path.to_path_buf(),
+            wal_id,
+            lsn,
             replay_skipped,
         })
     }
@@ -412,8 +477,10 @@ impl PersistentGraph {
             .map_err(|e| format!("create {}: {e}", tmp_path.display()))?;
         try_lock_exclusive(&tmp, &tmp_path)?;
         let mut w = BufWriter::new(tmp);
-        w.write_all(WAL_HEADER.as_bytes())
-            .and_then(|_| w.write_all(b"\n"))
+        // Same lineage id across compaction (mint one for legacy logs so the
+        // post-compaction sidecar binds to something).
+        let id = self.wal_id.clone().unwrap_or_else(new_wal_id);
+        w.write_all(format!("{WAL_HEADER} id={id}\n").as_bytes())
             .map_err(|e| e.to_string())?;
         for op in &ops {
             let json = serde_json::to_string(op).map_err(|e| e.to_string())?;
@@ -458,6 +525,10 @@ impl PersistentGraph {
             .into_inner()
             .map_err(|e| format!("adopt compacted WAL: {e}"))?;
         self.wal = BufWriter::new(f);
+        self.wal_id = Some(id);
+        // LSN restarts with the rewritten log so sidecars stamped after this
+        // agree with what a fresh replay of the new file will count.
+        self.lsn = ops.len() as u64;
 
         let bytes_after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         Ok(CompactReport {
@@ -471,6 +542,15 @@ impl PersistentGraph {
     /// Read access to the underlying graph (all temporal queries live there).
     pub fn graph(&self) -> &TemporalGraph {
         &self.graph
+    }
+
+    /// This WAL lineage's identity (None for headerless legacy logs).
+    pub fn wal_id(&self) -> Option<&str> {
+        self.wal_id.as_deref()
+    }
+    /// Current log sequence number (ops replayed + appended).
+    pub fn lsn(&self) -> u64 {
+        self.lsn
     }
 
     /// Journal-then-apply a single op (incremental path). Call `flush` at
