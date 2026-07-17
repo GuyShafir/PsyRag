@@ -12,6 +12,25 @@ Apply to every subcommand:
 | `--wal PATH` | `psyrag.wal` | graph WAL (facts). Created if absent. |
 | `--sidecar PATH` | `<wal>.psyrag.json` | plasticity state (weights, decay, homeostat) |
 | `--config PATH` | built-in defaults | config JSON (see below) |
+| `--data-dir DIR` | — | multi-database layout: each DB lives in `DIR/<name>/{wal,sidecar.json,config.json}` |
+| `--db NAME` | `default` | which database to address (requires `--data-dir`) |
+
+With `--data-dir`, per-DB config precedence is: explicit `--config` > the DB's
+own `config.json` > built-in defaults. DB names match `[a-z0-9_-]{1,64}`.
+
+## Durability & single-writer
+
+- The WAL is CRC-framed (`crc32hex8:{json}` per line, `#psyrag-wal:v1` header);
+  legacy plain-NDJSON logs replay transparently and are appended to in the new
+  format. A torn final record (crash mid-append) is truncated and recovered
+  automatically; corruption anywhere else refuses to open (restore from
+  backup) — a silently skipped record would misalign all sidecar `EdgeId`s.
+- Batch boundaries fsync the WAL; sidecar snapshots are written atomically
+  (temp + fsync + rename); retrieval traces are fsynced on store. A 2xx from a
+  mutating HTTP endpoint means the change is on disk.
+- The WAL is held under an exclusive lock (`flock`): running the CLI against a
+  WAL a live `psyrag serve` owns fails fast with a clear error. Use the HTTP
+  API against a running server.
 
 ## CLI commands
 
@@ -58,15 +77,61 @@ Export the learned graph as BigQuery-ready NDJSON + DDL + GQL + a load script.
 Defaults: `--out ./bq_out`, `--dataset psyrag`. No GCP credentials needed to
 produce the artifacts. See [gcp/README.md](../gcp/README.md).
 
-### `psyrag serve [--addr HOST:PORT]`
-Run the HTTP server (default `0.0.0.0:8080`) with the web console at `/`.
+### `psyrag db {list | create NAME} --data-dir DIR`
+Manage the multi-database layout from the CLI: `list` prints every database
+under the data dir (with WAL size), `create` materializes a new one.
+
+### `psyrag serve [flags]`
+Run the HTTP server with the web console at `/`.
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--addr HOST:PORT` | `127.0.0.1:8080` | bind address (loopback by default; pair a public bind with `--token`) |
+| `--data-dir DIR` | — | serve every database under `DIR` (multi-DB mode) |
+| `--token T` | `$PSYRAG_TOKEN` | bearer token for full access; unset = open mode |
+| `--read-token T` | `$PSYRAG_READ_TOKEN` | bearer token restricted to read endpoints |
+| `--workers N` | `min(cores, 8)` | request worker threads |
+| `--max-body-mb N` | 32 | request body cap (oversize → 413) |
+| `--max-open-dbs N` | 64 | concurrently open databases (LRU-evicts idle ones) |
+
+The server drains and flushes every open database on SIGINT/SIGTERM (clean
+Docker stops). Without `--data-dir` it serves the single `--wal` database.
 
 ### `psyrag monitor [--url URL] [--interval-ms N]`
-Live terminal dashboard polling a running server's `/metrics`.
+Live terminal dashboard polling a running server's `/metrics` (open-mode
+servers only; it sends no auth header).
 
 ## HTTP API
 
 Base URL is the `serve` address. All bodies and responses are JSON.
+
+**Databases.** Bare routes (below) address the `default` database. Prefix any
+of them with `/db/{name}` to address another database (multi-DB mode):
+`POST /db/tenant-a/retrieve`, `GET /db/tenant-a/stats`, … Databases are fully
+isolated — separate WAL, sidecar, traces, config, and locks; one DB's ingest
+never blocks another DB's retrieval.
+
+**Auth.** With `--token`/`--read-token` set, every endpoint except
+`/health`, `/live`, `/ready`, and the UI shell requires
+`Authorization: Bearer <token>`. The read token may hit GET endpoints,
+`POST /match`, and `POST /retrieve` only with `"adapt": false, "trace": false`
+(both mutate state). Everything else needs the full token.
+
+### `GET /dbs`
+`{ "dbs": [{db, open, nodes?, edges?, traces?}] }` — every database on disk
+plus its open state.
+
+### `POST /db/{name}`
+Create (or ensure) a database. Requires multi-DB mode and write scope.
+
+### `DELETE /db/{name}`
+Drop a database — closes it and deletes its directory. Irreversible, so it is
+disabled unless the server runs with `--token`; returns 409 while requests are
+in flight.
+
+### `GET /live` and `GET /ready`
+Liveness / readiness probes (readiness implies the default DB replayed
+successfully at startup). Unauthenticated.
 
 ### `GET /` and `GET /ui`
 The web console (HTML). See [integrations.md](integrations.md).

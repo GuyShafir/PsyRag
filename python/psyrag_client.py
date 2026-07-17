@@ -13,23 +13,38 @@ from typing import Any, Optional
 
 
 class PsyRagClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:8080", timeout: float = 5.0):
-        self.base = base_url.rstrip("/")
+    def __init__(self, base_url: str = "http://127.0.0.1:8080", timeout: float = 5.0,
+                 *, db: Optional[str] = None, token: Optional[str] = None):
+        """`db` addresses a named database on a multi-DB server (routes become
+        `/db/{db}/...`); omit it for the default database. `token` is sent as
+        `Authorization: Bearer` when the server runs with --token."""
+        self._root = base_url.rstrip("/")
+        self.base = self._root
+        if db:
+            self.base += f"/db/{db}"
         self.timeout = timeout
+        self.token = token
 
     # -- low-level ----------------------------------------------------------
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json"}
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        return h
+
     def _post_sync(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(
             self.base + path,
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read().decode())
 
     def _get_sync(self, path: str) -> dict:
-        with urllib.request.urlopen(self.base + path, timeout=self.timeout) as r:
+        req = urllib.request.Request(self.base + path, headers=self._headers())
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read().decode())
 
     async def _post(self, path: str, body: dict) -> dict:
@@ -101,3 +116,22 @@ class PsyRagClient:
         """Resolve free-text tokens to existing node names (substring, case-insensitive)."""
         r = await self._post("/match", {"tokens": tokens, "limit": limit})
         return r.get("nodes", [])
+
+    # -- multi-db admin (server-level routes, independent of this client's db) --
+    async def create_db(self, name: str) -> dict:
+        """Create (or ensure) a named database on a multi-DB server."""
+        def _sync() -> dict:
+            req = urllib.request.Request(
+                f"{self._root}/db/{name}", headers=self._headers(), method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read().decode())
+        return await asyncio.to_thread(_sync)
+
+    async def list_dbs(self) -> list[dict]:
+        """List databases on the server (name, open state, sizes)."""
+        def _sync() -> dict:
+            req = urllib.request.Request(f"{self._root}/dbs", headers=self._headers())
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read().decode())
+        return (await asyncio.to_thread(_sync)).get("dbs", [])

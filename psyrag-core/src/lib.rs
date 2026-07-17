@@ -416,11 +416,14 @@ impl PlasticityLayer {
     }
 
     /// Reinforce edges: decay-to-now then add alpha*clip(R). Batch write.
+    /// Non-finite R (NaN/inf from a bad client or parse) is dropped, never
+    /// written: `NaN.clamp()` is NaN and a single NaN weight would poison
+    /// every retrieval sort downstream.
     pub fn touch(&mut self, touches: &[(EdgeId, f32)], t_now: Ts) {
         let scale = self.lambda_scale();
         for &(eid, r) in touches {
             let i = eid as usize;
-            if i >= self.w.len() || self.dead[i] {
+            if i >= self.w.len() || self.dead[i] || !r.is_finite() {
                 continue;
             }
             let decayed = self.eff(eid, t_now, scale);
@@ -536,7 +539,7 @@ impl PlasticityLayer {
             .filter(|(_, &a)| a > 0.0)
             .map(|(i, &a)| (i as NodeId, a))
             .collect();
-        pairs.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
+        pairs.sort_by(|x, y| y.1.total_cmp(&x.1));
         pairs.truncate(top_k);
         let surfaced: Vec<(NodeId, f32)> = pairs.iter().map(|(id, a)| (*id, *a)).collect();
         let top = pairs
@@ -905,7 +908,7 @@ impl PlasticityLayer {
         let live_before = live_idx.len().max(1);
         // 2. protection threshold = (1 - frac) quantile of live weights
         let mut sorted: Vec<f32> = live_idx.iter().map(|&i| self.w[i]).collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(f32::total_cmp);
         let frac = self.cfg.protect_top_frac.clamp(0.0, 1.0);
         let q = ((1.0 - frac) * (sorted.len().saturating_sub(1)) as f32).round() as usize;
         let protect_thr = if sorted.is_empty() { f32::MAX } else { sorted[q.min(sorted.len() - 1)] };
@@ -999,7 +1002,11 @@ impl PlasticityLayer {
     /// mask, homeostat, scale) to JSON. EdgeIds are stable across WAL replay, so
     /// this composes with the on-disk WAL. Call `sync` after `load` to cover any
     /// edges appended since the snapshot.
+    ///
+    /// The write is atomic (temp file + fsync + rename): a crash mid-save
+    /// leaves the previous snapshot intact, never a truncated one.
     pub fn save(&self, path: &str) -> Result<(), String> {
+        use std::io::Write as _;
         let p = Persisted {
             w: &self.w,
             t_last: &self.t_last,
@@ -1009,7 +1016,23 @@ impl PlasticityLayer {
             homeo: &self.homeo,
         };
         let s = serde_json::to_string(&p).map_err(|e| e.to_string())?;
-        std::fs::write(path, s).map_err(|e| e.to_string())
+        let tmp = format!("{path}.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {tmp}: {e}"))?;
+            f.write_all(s.as_bytes())
+                .map_err(|e| format!("write {tmp}: {e}"))?;
+            f.sync_all().map_err(|e| format!("fsync {tmp}: {e}"))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp} -> {path}: {e}"))?;
+        // Persist the rename itself (directory entry), best-effort.
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
 
     /// Load a sidecar snapshot if the file exists (no-op if absent).

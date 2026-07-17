@@ -97,10 +97,105 @@ fn torn_tail_is_tolerated() {
     f.write_all(b"{\"op\":\"observe_node\",\"name\":\"b\",\"asset_t").unwrap();
     drop(f);
 
+    {
+        let pg = PersistentGraph::open(&path).unwrap();
+        assert_eq!(pg.replay_skipped, 1);
+        assert!(pg.graph().id_of("a").is_some());
+        assert!(pg.graph().id_of("b").is_none());
+    }
+    // The torn tail was truncated on recovery: a clean reopen sees no skips
+    // and the recovered state is unchanged.
     let pg = PersistentGraph::open(&path).unwrap();
-    assert_eq!(pg.replay_skipped, 1);
+    assert_eq!(pg.replay_skipped, 0);
     assert!(pg.graph().id_of("a").is_some());
-    assert!(pg.graph().id_of("b").is_none());
 
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn mid_file_corruption_is_a_hard_error() {
+    let path = std::env::temp_dir().join("psyrag_midcorrupt.wal");
+    let _ = fs::remove_file(&path);
+    {
+        let mut pg = PersistentGraph::open(&path).unwrap();
+        for n in ["a", "b", "c"] {
+            pg.record_op(Op::ObserveNode {
+                name: n.into(),
+                asset_type: "t/x".into(),
+                props: serde_json::Value::Null,
+                ts: T1,
+            })
+            .unwrap();
+        }
+        pg.flush().unwrap();
+    }
+    // Flip a byte in the middle of the file (inside record "b"'s json).
+    let mut bytes = fs::read(&path).unwrap();
+    let pos = bytes
+        .windows(3)
+        .position(|w| w == b"\"b\"")
+        .expect("record b present");
+    bytes[pos + 1] = b'X';
+    // keep length identical so only the CRC breaks
+    fs::write(&path, &bytes).unwrap();
+
+    let err = match PersistentGraph::open(&path) {
+        Ok(_) => panic!("mid-file corruption must not replay"),
+        Err(e) => e,
+    };
+    assert!(err.contains("corrupted"), "unexpected error: {err}");
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn second_opener_is_refused_while_locked() {
+    let path = std::env::temp_dir().join("psyrag_locked.wal");
+    let _ = fs::remove_file(&path);
+    let _holder = PersistentGraph::open(&path).unwrap();
+    let err = match PersistentGraph::open(&path) {
+        Ok(_) => panic!("second opener must be refused"),
+        Err(e) => e,
+    };
+    assert!(err.contains("locked"), "unexpected error: {err}");
+    drop(_holder);
+    // Released on drop.
+    assert!(PersistentGraph::open(&path).is_ok());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn legacy_v0_wal_replays_and_mixes_with_framed_appends() {
+    let path = std::env::temp_dir().join("psyrag_legacy.wal");
+    let _ = fs::remove_file(&path);
+    // Hand-write a v0 (plain NDJSON, headerless) log.
+    fs::write(
+        &path,
+        concat!(
+            "{\"op\":\"observe_node\",\"name\":\"old\",\"asset_type\":\"t/x\",\"props\":null,\"ts\":1000}\n",
+            "{\"op\":\"observe_edge\",\"src\":\"old\",\"dst\":\"tgt\",\"kind\":\"CALLS\",\"ts\":1000}\n",
+        ),
+    )
+    .unwrap();
+    {
+        let mut pg = PersistentGraph::open(&path).unwrap();
+        assert_eq!(pg.replay_skipped, 0);
+        assert!(pg.graph().id_of("old").is_some());
+        assert!(pg.graph().id_of("tgt").is_some());
+        // Append through the current (framed) format.
+        pg.record_op(Op::ObserveNode {
+            name: "new".into(),
+            asset_type: "t/x".into(),
+            props: serde_json::Value::Null,
+            ts: T2,
+        })
+        .unwrap();
+        pg.flush().unwrap();
+    }
+    // Mixed legacy + framed file replays fully.
+    let pg = PersistentGraph::open(&path).unwrap();
+    assert_eq!(pg.replay_skipped, 0);
+    assert!(pg.graph().id_of("old").is_some());
+    assert!(pg.graph().id_of("new").is_some());
     let _ = fs::remove_file(&path);
 }

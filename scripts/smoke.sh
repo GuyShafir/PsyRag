@@ -64,6 +64,41 @@ SL=$(curl -s -X POST "$URL/sleep" -H 'Content-Type: application/json' -d '{"ts":
 DS=$(echo "$SL" | j "d['downscaled']"); PR=$(echo "$SL" | j "d['protected']")
 [ "$DS" -ge 1 ] && ok "sleep ran (downscaled=$DS, protected=$PR)" || no "sleep did not run"
 
-kill $SRV 2>/dev/null; rm -rf "$WORK"
+kill $SRV 2>/dev/null; sleep 0.5
+
+echo "== 8. multidb: isolation + auth =="
+MPORT=$((PORT+1)); MURL="http://127.0.0.1:${MPORT}"
+"$BIN" --data-dir "$WORK/dbs" serve --addr "127.0.0.1:${MPORT}" \
+  --token adminsecret --read-token viewersecret >"$WORK/serve-mdb.log" 2>&1 &
+MSRV=$!; sleep 1.5
+AH='Authorization: Bearer adminsecret'; RH='Authorization: Bearer viewersecret'
+# unauthenticated write refused
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$MURL/ingest" -d '{"json":"[]"}')
+[ "$C" = "401" ] && ok "unauthenticated write -> 401" || no "expected 401 got $C"
+# create a second db and ingest disjoint facts into both
+curl -s -X POST -H "$AH" "$MURL/db/tenant-b" >/dev/null
+curl -s -X POST -H "$AH" "$MURL/ingest" -H 'Content-Type: application/json' \
+  -d '{"json":"[{\"name\":\"alpha\",\"type\":\"t\",\"edges\":[{\"dst\":\"beta\",\"kind\":\"REL\"}]}]","ts":1000}' >/dev/null
+curl -s -X POST -H "$AH" "$MURL/db/tenant-b/ingest" -H 'Content-Type: application/json' \
+  -d '{"json":"[{\"name\":\"gamma\",\"type\":\"t\",\"edges\":[{\"dst\":\"delta\",\"kind\":\"REL\"}]}]","ts":1000}' >/dev/null
+DEF=$(curl -s -X POST -H "$AH" "$MURL/retrieve" -d '{"seeds":["gamma"],"adapt":false,"ts":2000}' | j "len(d['top'])")
+TEN=$(curl -s -X POST -H "$AH" "$MURL/db/tenant-b/retrieve" -d '{"seeds":["gamma"],"adapt":false,"ts":2000}' | j "len(d['top'])")
+[ "$DEF" = "0" ] && [ "$TEN" -ge 2 ] && ok "dbs are isolated (gamma only in tenant-b)" || no "isolation broken (default=$DEF tenant-b=$TEN)"
+# read token can read but not write or adapt
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$RH" "$MURL/db/tenant-b/retrieve" -d '{"seeds":["gamma"],"adapt":false}')
+[ "$C" = "200" ] && ok "read token can retrieve" || no "read token retrieve got $C"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$RH" "$MURL/db/tenant-b/ingest" -d '{"json":"[]"}')
+[ "$C" = "403" ] && ok "read token cannot write -> 403" || no "expected 403 got $C"
+kill $MSRV 2>/dev/null; sleep 0.5
+
+echo "== 9. single-writer lock =="
+"$BIN" --wal "$WAL" serve --addr "127.0.0.1:${PORT}" >"$WORK/serve3.log" 2>&1 &
+SRV=$!; sleep 1.5
+"$BIN" --wal "$WAL" stats >/dev/null 2>&1 \
+  && no "CLI opened a WAL held by the server" \
+  || ok "CLI refused while server holds the WAL lock"
+kill $SRV 2>/dev/null; sleep 0.5
+
+rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

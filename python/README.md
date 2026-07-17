@@ -29,7 +29,7 @@ psyrag serve --addr 127.0.0.1:8080
 
 # 2. this package
 pip install google-adk          # for the ADK integration
-# engrag_client.py has zero deps (stdlib only)
+# psyrag_client.py has zero deps (stdlib only)
 ```
 
 ## Drop-in memory service
@@ -38,9 +38,12 @@ pip install google-adk          # for the ADK integration
 from google.adk.agents import LlmAgent
 from google.adk.tools import load_memory
 from google.adk.runners import Runner
-from engrag_memory import PsyRagMemoryService, make_citation_feedback_callback
+from psyrag_memory import PsyRagMemoryService, make_citation_feedback_callback
 
 memory = PsyRagMemoryService("http://127.0.0.1:8080", top_k=8, depth=2)
+# multi-tenant: one isolated database per app/user on a --data-dir server,
+# and a bearer token if the server runs with --token:
+#   PsyRagMemoryService(..., db="tenant-a", token=os.environ["PSYRAG_TOKEN"])
 
 agent = LlmAgent(
     model="gemini-flash-latest", name="assistant",
@@ -110,5 +113,6 @@ on the memory layer itself.
   path (feed domain events, seed on entity names) sidesteps it entirely.
 - **Causal caveat**: usage credit means "on a path to something useful," not
   "causal." Keep edge kinds `predicts`/`precedes`, never `causes`.
-- **Deferred trace store is in-memory**: pending traces are lost if `psyrag serve`
-  restarts. Fine for online feedback; durable deferred credit is future work.
+- **Deferred traces are durable**: `psyrag serve` persists retrieval traces
+  (`<sidecar>.traces.jsonl`), so deferred credit still lands after a restart.
+  The store is a bounded FIFO (4096) — credit very old traces promptly.
