@@ -38,7 +38,11 @@ Where a RAG store returns the same thing forever, PsyRag learns.
   recall learns from use, plus feedback adapters and a zero-dep client.
 - **Optional GCP backends** — Spanner Graph as long-term system-of-record,
   BigQuery as the analytics/replay sink.
-- **Durable** — WAL-backed graph, persisted plasticity state, durable trace store.
+- **Durable** — CRC-framed, fsynced WAL; atomic sidecar snapshots; durable
+  trace store; single-writer locking; graceful shutdown. A 2xx means it's on disk.
+- **Multi-database** — one server, many fully isolated databases
+  (`/db/{name}/…`): per-DB WAL, config, and locks. Per tenant, per agent, per env.
+- **Auth** — bearer tokens with full and read-only scopes; loopback bind by default.
 
 ## Quickstart
 

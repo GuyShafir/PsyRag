@@ -1,18 +1,311 @@
-//! HTTP service: holds the WAL-backed graph + plasticity sidecar in memory and
-//! exposes the coarse per-query / per-cycle surface. This is the loop you drive
-//! while iterating; `psyrag monitor` polls `/metrics`.
+//! HTTP service: a registry of independent databases (each a WAL-backed graph
+//! + plasticity sidecar + durable trace store), served by a small worker pool.
+//!
+//! Isolation model: every database has its own `RwLock<Engine>`, its own WAL
+//! flock, and its own on-disk directory — one DB's ingest or sleep never
+//! blocks another DB's retrieval. Routes are `/db/{name}/...`; the bare
+//! legacy routes (`/retrieve`, ...) map to the `default` database.
+//!
+//! Durability contract: a 2xx from a mutating endpoint means the change is on
+//! disk (WAL fsynced / sidecar atomically replaced / trace fsynced). Failures
+//! to persist are 5xx, never silently swallowed.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::io::Read as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use psyrag_graph::PersistentGraph;
 use psyrag_core::{Config, Credit, PlasticityLayer, Spread};
+use psyrag_graph::PersistentGraph;
 use serde::Deserialize;
-use tiny_http::{Method, Response, Server};
+use tiny_http::{Method, Request, Response, Server};
 
-use crate::engine::{now_ms, Engine};
+use crate::engine::{now_ms, Engine, TraceStore};
 
 /// Self-contained management + visualization UI (served at `/` and `/ui`).
+/// The console talks to the bare routes, i.e. the `default` database.
 const UI_HTML: &str = include_str!("ui.html");
+
+pub const DEFAULT_DB: &str = "default";
+const RECV_TICK: Duration = Duration::from_millis(300);
+
+type Resp = Response<std::io::Cursor<Vec<u8>>>;
+
+// ===========================================================================
+// Options & registry
+// ===========================================================================
+
+pub struct ServeOpts {
+    pub addr: String,
+    /// Multi-DB root: each database lives in `<data_dir>/<name>/`. None =
+    /// legacy single-DB mode using `wal`/`sidecar` below for `default`.
+    pub data_dir: Option<PathBuf>,
+    pub wal: String,
+    pub sidecar: String,
+    /// Server-wide default plasticity config; a DB's `config.json` overrides.
+    pub cfg: Config,
+    /// Bearer token for full access. None (with no read_token) = open mode.
+    pub token: Option<String>,
+    /// Bearer token restricted to read endpoints.
+    pub read_token: Option<String>,
+    pub max_body: usize,
+    pub workers: usize,
+    pub max_open_dbs: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Scope {
+    Full,
+    Read,
+}
+
+/// A JSON response as (status, bytes) — kept in this form so idempotent
+/// replays can cache and re-serve it byte-identically.
+struct JsonOut {
+    code: u16,
+    body: Vec<u8>,
+}
+fn jout<T: serde::Serialize>(v: &T, code: u16) -> JsonOut {
+    JsonOut { code, body: serde_json::to_vec(v).unwrap_or_default() }
+}
+fn jerr(msg: &str, code: u16) -> JsonOut {
+    jout(&serde_json::json!({ "error": msg }), code)
+}
+impl JsonOut {
+    fn into_resp(self, replayed: bool) -> Resp {
+        let mut r = Response::from_data(self.body)
+            .with_status_code(self.code)
+            .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+        if replayed {
+            r = r.with_header("Idempotency-Replayed: true".parse::<tiny_http::Header>().unwrap());
+        }
+        r
+    }
+}
+
+/// In-memory idempotent-retry dedup: replays the stored response for a
+/// repeated (endpoint, Idempotency-Key) within the window. Dedup spans the
+/// process lifetime only — durable dedup across restarts is future work
+/// (needs WAL stamping).
+const IDEM_CAP: usize = 4096;
+const IDEM_WINDOW: Duration = Duration::from_secs(24 * 3600);
+const IDEM_INFLIGHT_STALE: Duration = Duration::from_secs(60);
+
+enum IdemEntry {
+    InFlight { at: Instant },
+    Done { code: u16, body: Vec<u8>, at: Instant },
+}
+#[derive(Default)]
+struct IdemCache {
+    map: HashMap<String, IdemEntry>,
+    order: std::collections::VecDeque<String>,
+}
+impl IdemCache {
+    fn evict(&mut self) {
+        while self.order.len() > IDEM_CAP {
+            if let Some(k) = self.order.pop_front() {
+                self.map.remove(&k);
+            }
+        }
+        while let Some(k) = self.order.front() {
+            let stale = match self.map.get(k) {
+                Some(IdemEntry::Done { at, .. }) => at.elapsed() > IDEM_WINDOW,
+                Some(IdemEntry::InFlight { .. }) | None => false,
+            };
+            if stale {
+                let k = self.order.pop_front().unwrap();
+                self.map.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+struct Db {
+    engine: RwLock<Engine>,
+    last_used: Mutex<Instant>,
+    idem: Mutex<IdemCache>,
+    /// Where this DB's config.json lives (multi-DB mode) — quarantine
+    /// updates persist there so trust survives restarts.
+    cfg_path: Option<PathBuf>,
+}
+
+struct Registry {
+    opts: ServeOpts,
+    dbs: RwLock<HashMap<String, Arc<Db>>>,
+}
+
+pub fn valid_db_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
+fn open_engine_at(wal: &str, sidecar: &str, cfg: Config) -> Result<Engine, String> {
+    let pg = PersistentGraph::open(wal)?;
+    let mut layer = PlasticityLayer::new(cfg);
+    // Bind BEFORE load so a sidecar from a different WAL is refused loudly.
+    layer.set_wal_binding(pg.wal_id(), pg.lsn());
+    layer.load_if_exists(pg.graph(), sidecar)?;
+    layer.sync(pg.graph());
+    let traces = TraceStore::open(4096, &format!("{sidecar}.traces.jsonl"));
+    Ok(Engine {
+        pg,
+        layer,
+        sidecar_path: sidecar.to_string(),
+        traces,
+        wedged: None,
+    })
+}
+
+impl Registry {
+    /// Resolve a database, lazily opening it. `create` also materializes the
+    /// on-disk directory (multi-DB mode). Errors are (status, message).
+    fn resolve(&self, name: &str, create: bool) -> Result<Arc<Db>, (u16, String)> {
+        if !valid_db_name(name) {
+            return Err((400, format!("invalid db name '{name}' (want [a-z0-9_-]{{1,64}})")));
+        }
+        if let Some(db) = self.dbs.read().unwrap().get(name) {
+            *db.last_used.lock().unwrap() = Instant::now();
+            return Ok(db.clone());
+        }
+        let mut map = self.dbs.write().unwrap();
+        if let Some(db) = map.get(name) {
+            *db.last_used.lock().unwrap() = Instant::now();
+            return Ok(db.clone());
+        }
+        // Resolve on-disk paths + per-DB config.
+        let mut cfg_path: Option<PathBuf> = None;
+        let (wal, sidecar, cfg) = match &self.opts.data_dir {
+            None => {
+                if name != DEFAULT_DB {
+                    return Err((
+                        400,
+                        "multi-database mode requires the server to run with --data-dir".into(),
+                    ));
+                }
+                (self.opts.wal.clone(), self.opts.sidecar.clone(), self.opts.cfg.clone())
+            }
+            Some(root) => {
+                let dir = root.join(name);
+                if !dir.is_dir() {
+                    // `default` is materialized on demand so a bare server
+                    // works out of the box; other DBs must be created.
+                    if create || name == DEFAULT_DB {
+                        std::fs::create_dir_all(&dir)
+                            .map_err(|e| (500, format!("create {}: {e}", dir.display())))?;
+                    } else {
+                        return Err((
+                            404,
+                            format!("unknown db '{name}' (create it with POST /db/{name})"),
+                        ));
+                    }
+                }
+                let cp = dir.join("config.json");
+                let cfg = if cp.is_file() {
+                    crate::config::load(Some(cp.to_str().unwrap_or_default()))
+                        .map_err(|e| (500, format!("db '{name}' config: {e}")))?
+                } else {
+                    self.opts.cfg.clone()
+                };
+                cfg_path = Some(cp);
+                (
+                    dir.join("wal").to_string_lossy().into_owned(),
+                    dir.join("sidecar.json").to_string_lossy().into_owned(),
+                    cfg,
+                )
+            }
+        };
+        // Respect the open-DB cap: evict the least-recently-used idle entry.
+        if map.len() >= self.opts.max_open_dbs {
+            let victim = map
+                .iter()
+                .filter(|(_, db)| Arc::strong_count(db) == 1) // idle: only the map holds it
+                .min_by_key(|(_, db)| *db.last_used.lock().unwrap())
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    // Dropping the Arc closes the engine: WAL flock released,
+                    // buffered records flushed by PersistentGraph::drop.
+                    map.remove(&k);
+                }
+                None => {
+                    return Err((
+                        503,
+                        format!(
+                            "open database limit reached ({}) and none are idle",
+                            self.opts.max_open_dbs
+                        ),
+                    ));
+                }
+            }
+        }
+        let engine = open_engine_at(&wal, &sidecar, cfg).map_err(|e| (503, e))?;
+        let db = Arc::new(Db {
+            engine: RwLock::new(engine),
+            last_used: Mutex::new(Instant::now()),
+            idem: Mutex::new(IdemCache::default()),
+            cfg_path,
+        });
+        map.insert(name.to_string(), db.clone());
+        Ok(db)
+    }
+
+    /// Authenticate a request. Open mode (no tokens configured) grants Full.
+    fn auth(&self, req: &Request) -> Result<Scope, Resp> {
+        if self.opts.token.is_none() && self.opts.read_token.is_none() {
+            return Ok(Scope::Full);
+        }
+        let presented = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str().to_string())
+            .and_then(|v| v.strip_prefix("Bearer ").map(String::from));
+        let Some(presented) = presented else {
+            return Err(err("missing Authorization: Bearer token", 401));
+        };
+        if self.opts.token.as_deref().is_some_and(|t| ct_eq(t, &presented)) {
+            return Ok(Scope::Full);
+        }
+        if self.opts.read_token.as_deref().is_some_and(|t| ct_eq(t, &presented)) {
+            return Ok(Scope::Read);
+        }
+        Err(err("invalid token", 401))
+    }
+
+    /// Flush every open database: WAL fsync + sidecar snapshot. Used at
+    /// graceful shutdown; failures are reported, not ignored.
+    fn flush_all(&self) {
+        let map = self.dbs.read().unwrap();
+        for (name, db) in map.iter() {
+            let mut e = db.engine.write().unwrap();
+            if let Err(er) = e.pg.flush() {
+                eprintln!("psyrag: shutdown flush of db '{name}' WAL failed: {er}");
+            }
+            if let Err(er) = e.save_sidecar() {
+                eprintln!("psyrag: shutdown save of db '{name}' sidecar failed: {er}");
+            }
+        }
+    }
+}
+
+/// Constant-time string equality (token comparison).
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+// ===========================================================================
+// Request DTOs (unchanged wire shapes)
+// ===========================================================================
 
 #[derive(Deserialize)]
 struct IngestReq {
@@ -22,6 +315,11 @@ struct IngestReq {
     #[serde(default)]
     cai: bool,
     ts: Option<i64>,
+    /// Provenance label for every fact in this batch (per-entity `origin`
+    /// in the payload overrides it). Conventions like
+    /// "user:alice/session:42" enable trust levels and purge-by-subject.
+    #[serde(default)]
+    origin: Option<String>,
 }
 #[derive(Deserialize)]
 struct RetrieveReq {
@@ -36,6 +334,10 @@ struct RetrieveReq {
     /// Store the trace and return a `trace_id` for deferred feedback.
     #[serde(default)]
     trace: bool,
+    /// Return the activation paths (fired edges) alongside the result.
+    /// Read-only; allowed under the read scope.
+    #[serde(default)]
+    explain: bool,
 }
 fn d_match_limit() -> usize {
     16
@@ -77,58 +379,296 @@ struct FeedbackReq {
     ts: Option<i64>,
 }
 
-fn json_resp<T: serde::Serialize>(v: &T, code: u16) -> Response<std::io::Cursor<Vec<u8>>> {
+fn json_resp<T: serde::Serialize>(v: &T, code: u16) -> Resp {
     let body = serde_json::to_vec(v).unwrap_or_default();
     Response::from_data(body)
         .with_status_code(code)
         .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap())
 }
-fn err(msg: &str, code: u16) -> Response<std::io::Cursor<Vec<u8>>> {
+fn err(msg: &str, code: u16) -> Resp {
     json_resp(&serde_json::json!({ "error": msg }), code)
 }
+fn html(body: &str) -> Resp {
+    Response::from_string(body)
+        .with_status_code(200)
+        .with_header("Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>().unwrap())
+}
 
-pub fn run(addr: &str, wal: &str, sidecar: &str, cfg: Config) -> Result<(), String> {
-    let pg = PersistentGraph::open(wal)?;
-    let mut layer = PlasticityLayer::new(cfg);
-    layer.load_if_exists(sidecar)?;
-    layer.sync(pg.graph());
+// ===========================================================================
+// Shutdown signal (zero-dependency SIGINT/SIGTERM handler)
+// ===========================================================================
 
-    let engine = Arc::new(Mutex::new(Engine {
-        pg,
-        layer,
-        sidecar_path: sidecar.to_string(),
-        traces: crate::engine::TraceStore::open(4096, &format!("{sidecar}.traces.jsonl")),
-    }));
+static STOP: AtomicBool = AtomicBool::new(false);
 
-    let server = Server::http(addr).map_err(|e| e.to_string())?;
-    eprintln!("psyrag serve on http://{addr}  (wal={wal} sidecar={sidecar})");
-
-    for mut request in server.incoming_requests() {
-        let method = request.method().clone();
-        let url = request.url().to_string();
-        let path = url.split('?').next().unwrap_or("/").to_string();
-        let mut body = String::new();
-        let _ = request.as_reader().read_to_string(&mut body);
-
-        let resp = handle(&engine, &method, &path, &body);
-        let _ = request.respond(resp);
+#[cfg(unix)]
+fn install_signal_handlers() {
+    extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
     }
+    extern "C" fn on_sig(_s: i32) {
+        // Async-signal-safe: a store on a static atomic.
+        STOP.store(true, Ordering::SeqCst);
+    }
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    unsafe {
+        signal(SIGINT, on_sig);
+        signal(SIGTERM, on_sig);
+    }
+}
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
+// ===========================================================================
+// Server loop
+// ===========================================================================
+
+pub fn run(opts: ServeOpts) -> Result<(), String> {
+    let workers = opts.workers.max(1);
+    let addr = opts.addr.clone();
+    let reg = Arc::new(Registry {
+        opts,
+        dbs: RwLock::new(HashMap::new()),
+    });
+    // Eager-open the default DB: startup fails loudly on a locked/corrupt
+    // WAL instead of surfacing it on the first request.
+    reg.resolve(DEFAULT_DB, true).map_err(|(_, m)| m)?;
+
+    let server = Arc::new(Server::http(&addr).map_err(|e| e.to_string())?);
+    install_signal_handlers();
+
+    let loopback = addr.starts_with("127.") || addr.starts_with("localhost") || addr.starts_with("[::1]");
+    if !loopback && reg.opts.token.is_none() && reg.opts.read_token.is_none() {
+        eprintln!("psyrag: WARNING: serving on {addr} without --token — anyone who can reach this port has full read/write access");
+    }
+    match &reg.opts.data_dir {
+        Some(root) => eprintln!("psyrag serve on http://{addr}  (data-dir={}, {workers} workers)", root.display()),
+        None => eprintln!("psyrag serve on http://{addr}  (wal={}, {workers} workers)", reg.opts.wal),
+    }
+
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let server = server.clone();
+        let reg = reg.clone();
+        handles.push(std::thread::spawn(move || loop {
+            if STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            match server.recv_timeout(RECV_TICK) {
+                Ok(Some(request)) => handle_request(&reg, request),
+                Ok(None) => continue,
+                Err(_) => {
+                    if STOP.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    eprintln!("psyrag: draining complete, flushing databases…");
+    reg.flush_all();
+    eprintln!("psyrag: clean shutdown");
     Ok(())
 }
 
-fn handle(
-    engine: &Arc<Mutex<Engine>>,
+fn handle_request(reg: &Arc<Registry>, mut request: Request) {
+    let method = request.method().clone();
+    let url = request.url().to_string();
+    let path = url.split('?').next().unwrap_or("/").to_string();
+
+    // Unauthenticated surface: health probes + the static UI shell.
+    let resp = match (&method, path.as_str()) {
+        (Method::Get, "/health") | (Method::Get, "/live") => json_resp(&serde_json::json!({"ok": true}), 200),
+        // Readiness: the default DB opened at startup, so serving == ready.
+        (Method::Get, "/ready") => json_resp(&serde_json::json!({"ready": true}), 200),
+        (Method::Get, "/") | (Method::Get, "/ui") | (Method::Get, "/ui/") => html(UI_HTML),
+        _ => match reg.auth(&request) {
+            Err(resp) => resp,
+            Ok(scope) => {
+                let idem_key = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Idempotency-Key"))
+                    .map(|h| h.value.as_str().to_string());
+                // Bounded body read (413 on oversize) for methods that carry one.
+                let body = if matches!(method, Method::Post | Method::Put | Method::Delete) {
+                    match read_body(&mut request, reg.opts.max_body) {
+                        Ok(b) => b,
+                        Err(resp) => {
+                            let _ = request.respond(resp);
+                            return;
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+                route(reg, scope, &method, &path, &body, idem_key.as_deref())
+            }
+        },
+    };
+    let _ = request.respond(resp);
+}
+
+fn read_body(request: &mut Request, max: usize) -> Result<String, Resp> {
+    if let Some(len) = request.body_length() {
+        if len > max {
+            return Err(err(&format!("body too large ({len} > {max} bytes)"), 413));
+        }
+    }
+    let mut body = String::new();
+    request
+        .as_reader()
+        .take(max as u64 + 1)
+        .read_to_string(&mut body)
+        .map_err(|e| err(&format!("read body: {e}"), 400))?;
+    if body.len() > max {
+        return Err(err(&format!("body too large (> {max} bytes)"), 413));
+    }
+    Ok(body)
+}
+
+/// Split a path into (db name, db-relative route). Bare routes address the
+/// default DB; `/db/{name}` itself yields an empty route (create/drop/info).
+fn split_route(path: &str) -> (String, String) {
+    if let Some(rest) = path.strip_prefix("/db/") {
+        match rest.split_once('/') {
+            Some((name, tail)) => {
+                let tail = tail.trim_end_matches('/');
+                (name.to_string(), if tail.is_empty() { String::new() } else { format!("/{tail}") })
+            }
+            None => (rest.trim_end_matches('/').to_string(), String::new()),
+        }
+    } else {
+        (DEFAULT_DB.to_string(), path.to_string())
+    }
+}
+
+fn route(reg: &Arc<Registry>, scope: Scope, method: &Method, path: &str, body: &str, idem_key: Option<&str>) -> Resp {
+    // Server-level admin routes.
+    if path == "/dbs" && *method == Method::Get {
+        return list_dbs(reg);
+    }
+    let (name, db_route) = split_route(path);
+
+    // /db/{name} itself: create / drop.
+    if db_route.is_empty() {
+        return match method {
+            Method::Post => {
+                if scope != Scope::Full {
+                    return err("write scope required", 403);
+                }
+                if reg.opts.data_dir.is_none() {
+                    return err("creating databases requires the server to run with --data-dir", 400);
+                }
+                match reg.resolve(&name, true) {
+                    Ok(_) => json_resp(&serde_json::json!({"db": name, "ready": true}), 200),
+                    Err((code, msg)) => err(&msg, code),
+                }
+            }
+            Method::Delete => drop_db(reg, scope, &name),
+            _ => err("use POST to create or DELETE to drop a database", 405),
+        };
+    }
+
+    match reg.resolve(&name, false) {
+        Ok(db) => handle_db(reg, &db, scope, method, &db_route, body, idem_key),
+        Err((code, msg)) => err(&msg, code),
+    }
+}
+
+fn list_dbs(reg: &Arc<Registry>) -> Resp {
+    let open = reg.dbs.read().unwrap();
+    let mut names: Vec<String> = match &reg.opts.data_dir {
+        Some(root) => std::fs::read_dir(root)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| valid_db_name(n))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => vec![DEFAULT_DB.to_string()],
+    };
+    names.sort();
+    names.dedup();
+    for n in open.keys() {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
+    let rows: Vec<serde_json::Value> = names
+        .iter()
+        .map(|n| match open.get(n) {
+            Some(db) => match db.engine.try_read() {
+                Ok(e) => serde_json::json!({
+                    "db": n, "open": true,
+                    "nodes": e.pg.graph().node_count(),
+                    "edges": e.pg.graph().edge_count(),
+                    "traces": e.traces.len(),
+                    "wedged": e.wedged,
+                }),
+                Err(_) => serde_json::json!({"db": n, "open": true, "busy": true}),
+            },
+            None => serde_json::json!({"db": n, "open": false}),
+        })
+        .collect();
+    json_resp(&serde_json::json!({"dbs": rows}), 200)
+}
+
+fn drop_db(reg: &Arc<Registry>, scope: Scope, name: &str) -> Resp {
+    if scope != Scope::Full {
+        return err("write scope required", 403);
+    }
+    // Dropping a database is irreversible; refuse entirely unless the
+    // operator opted into authentication.
+    if reg.opts.token.is_none() {
+        return err("DELETE /db/{name} is disabled unless the server runs with --token", 403);
+    }
+    let Some(root) = &reg.opts.data_dir else {
+        return err("dropping databases requires the server to run with --data-dir", 400);
+    };
+    if !valid_db_name(name) {
+        return err("invalid db name", 400);
+    }
+    {
+        let mut map = reg.dbs.write().unwrap();
+        if let Some(db) = map.get(name) {
+            if Arc::strong_count(db) > 1 {
+                return err("database busy (requests in flight); retry", 409);
+            }
+            map.remove(name); // drop closes the engine and releases the flock
+        }
+    }
+    let dir = root.join(name);
+    if dir.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            return err(&format!("remove {}: {e}", dir.display()), 500);
+        }
+    }
+    json_resp(&serde_json::json!({"dropped": name}), 200)
+}
+
+// ===========================================================================
+// Per-database endpoints
+// ===========================================================================
+
+fn handle_db(
+    reg: &Arc<Registry>,
+    db: &Arc<Db>,
+    scope: Scope,
     method: &Method,
     path: &str,
     body: &str,
-) -> Response<std::io::Cursor<Vec<u8>>> {
+    idem_key: Option<&str>,
+) -> Resp {
     match (method, path) {
-        (Method::Get, "/ui") | (Method::Get, "/ui/") => Response::from_string(UI_HTML)
-            .with_status_code(200)
-            .with_header("Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>().unwrap()),
+        (Method::Get, "/ui") => html(UI_HTML),
         (Method::Get, "/graph") => {
-            let guard = engine.lock().unwrap();
-            let e = &*guard;
+            let e = db.engine.read().unwrap();
             let g = e.pg.graph();
             let now = now_ms();
             let limit = 500usize;
@@ -155,14 +695,12 @@ fn handle(
             json_resp(&serde_json::json!({"nodes": nodes, "edges": edges, "truncated": edges.len() >= limit}), 200)
         }
         (Method::Get, "/traces") => {
-            let guard = engine.lock().unwrap();
-            let e = &*guard;
+            let e = db.engine.read().unwrap();
             json_resp(&serde_json::json!({"ids": e.traces.ids(), "count": e.traces.len()}), 200)
         }
         (m, p) if *m == Method::Get && p.starts_with("/trace/") => {
             let id: Option<u64> = p.trim_start_matches("/trace/").parse().ok();
-            let guard = engine.lock().unwrap();
-            let e = &*guard;
+            let e = db.engine.read().unwrap();
             let g = e.pg.graph();
             match id.and_then(|i| e.traces.get(i)) {
                 Some(tr) => {
@@ -182,119 +720,8 @@ fn handle(
         }
         (Method::Get, "/health") => json_resp(&serde_json::json!({"ok": true}), 200),
         (Method::Get, "/stats") | (Method::Get, "/metrics") => {
-            let guard = engine.lock().unwrap(); let e = &*guard;
+            let e = db.engine.read().unwrap();
             json_resp(&e.layer.stats(e.pg.graph()), 200)
-        }
-        (Method::Post, "/ingest") => {
-            let r: IngestReq = match serde_json::from_str(body) {
-                Ok(r) => r,
-                Err(e) => return err(&format!("bad body: {e}"), 400),
-            };
-            let ts = r.ts.unwrap_or_else(now_ms);
-            let mut guard = engine.lock().unwrap(); let e = &mut *guard;
-            let res = if r.cai {
-                #[cfg(feature = "gcp")]
-                {
-                    e.pg.ingest_cai_snapshot(&r.json, ts)
-                }
-                #[cfg(not(feature = "gcp"))]
-                {
-                    Err("built without gcp feature".to_string())
-                }
-            } else {
-                e.pg.ingest_entities(&r.json, ts, r.reconcile)
-            };
-            match res {
-                Ok(stale) => {
-                    e.layer.sync(e.pg.graph());
-                    json_resp(&serde_json::json!({"stale_retired": stale, "edges": e.pg.graph().edge_count()}), 200)
-                }
-                Err(msg) => err(&msg, 400),
-            }
-        }
-        (Method::Post, "/retrieve") => {
-            let r: RetrieveReq = match serde_json::from_str(body) {
-                Ok(r) => r,
-                Err(e) => return err(&format!("bad body: {e}"), 400),
-            };
-            let ts = r.ts.unwrap_or_else(now_ms);
-            let mut guard = engine.lock().unwrap(); let e = &mut *guard;
-            let seeds: Vec<&str> = r.seeds.iter().map(|s| s.as_str()).collect();
-            let depth = r.depth.unwrap_or(e.layer.cfg.depth);
-            let fan = r.fan.unwrap_or(e.layer.cfg.fan);
-            let result = if r.adapt {
-                // retrieve then observe
-                let mut res = e.layer.retrieve(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
-                let s = e.layer.observe(res.mass);
-                res.lambda_scale = s;
-                res
-            } else {
-                e.layer.retrieve(e.pg.graph(), &seeds, depth, fan, r.top_k, ts)
-            };
-            if r.trace {
-                let (res2, tr) =
-                    e.layer.retrieve_traced(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
-                let id = e.traces.put(tr);
-                json_resp(&serde_json::json!({"result": res2, "trace_id": id}), 200)
-            } else {
-                json_resp(&result, 200)
-            }
-        }
-        (Method::Post, "/touch") => {
-            let r: TouchReq = match serde_json::from_str(body) {
-                Ok(r) => r,
-                Err(e) => return err(&format!("bad body: {e}"), 400),
-            };
-            let ts = r.ts.unwrap_or_else(now_ms);
-            let mut guard = engine.lock().unwrap(); let e = &mut *guard;
-            let mut touches = Vec::new();
-            let mut missed = 0;
-            for (s, d, k, rr) in &r.edges {
-                match e.layer.edge_id(e.pg.graph(), s, d, k) {
-                    Some(eid) => touches.push((eid, *rr)),
-                    None => missed += 1,
-                }
-            }
-            e.layer.touch(&touches, ts);
-            json_resp(&serde_json::json!({"touched": touches.len(), "missed": missed}), 200)
-        }
-        (Method::Post, "/feedback") => {
-            let r: FeedbackReq = match serde_json::from_str(body) {
-                Ok(r) => r,
-                Err(e) => return err(&format!("bad body: {e}"), 400),
-            };
-            let ts = r.ts.unwrap_or_else(now_ms);
-            let mut guard = engine.lock().unwrap();
-            let e = &mut *guard;
-            // build the Credit (nodes > reward > used)
-            let hit = e.layer.cfg.feedback_hit;
-            let credit = if let Some(nodes) = r.nodes.clone() {
-                Credit::Nodes(nodes)
-            } else if let Some(reward) = r.reward {
-                Credit::Episodic { reward, spread: r.spread.unwrap_or(Spread::ByActivation) }
-            } else if let Some(used) = r.used.clone() {
-                Credit::Nodes(used.into_iter().map(|n| (n, hit)).collect())
-            } else {
-                return err("feedback needs one of: nodes, reward, used", 400);
-            };
-            // get the trace: deferred (trace_id) or stateless (recompute)
-            let trace = if let Some(id) = r.trace_id {
-                match e.traces.get(id) {
-                    Some(t) => t,
-                    None => return err("unknown trace_id (evicted or never issued)", 404),
-                }
-            } else if let Some(seeds) = r.seeds.clone() {
-                let sref: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
-                let depth = r.depth.unwrap_or(e.layer.cfg.depth);
-                let fan = r.fan.unwrap_or(e.layer.cfg.fan);
-                let (_res, tr) = e.layer.retrieve_traced(e.pg.graph(), &sref, depth, fan, r.top_k, ts);
-                tr
-            } else {
-                return err("feedback needs trace_id or seeds", 400);
-            };
-            let report = e.layer.apply_credit(e.pg.graph(), &trace, &credit, ts);
-            let _ = e.layer.save(&e.sidecar_path);
-            json_resp(&report, 200)
         }
         (Method::Post, "/match") => {
             #[derive(Deserialize)]
@@ -307,8 +734,7 @@ fn handle(
                 Ok(r) => r,
                 Err(e) => return err(&format!("bad body: {e}"), 400),
             };
-            let guard = engine.lock().unwrap();
-            let e = &*guard;
+            let e = db.engine.read().unwrap();
             let g = e.pg.graph();
             let toks: Vec<String> = r.tokens.iter().map(|t| t.to_lowercase()).collect();
             let mut hits = Vec::new();
@@ -324,19 +750,370 @@ fn handle(
             }
             json_resp(&serde_json::json!({ "nodes": hits }), 200)
         }
+        (Method::Post, "/retrieve") => {
+            let r: RetrieveReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return err(&format!("bad body: {e}"), 400),
+            };
+            if scope == Scope::Read && (r.adapt || r.trace) {
+                return err(
+                    "read scope: retrieval must set adapt=false and trace=false (both mutate state)",
+                    403,
+                );
+            }
+            let ts = r.ts.unwrap_or_else(now_ms);
+            let seeds: Vec<&str> = r.seeds.iter().map(|s| s.as_str()).collect();
+            // Renders a trace's fired edges as the explain payload.
+            let explain_json = |g: &psyrag_graph::TemporalGraph, tr: &psyrag_core::Trace| {
+                let fired: Vec<_> = tr.fired().iter().map(|(eid, u, v, d)| {
+                    serde_json::json!({
+                        "src": g.node_name(*u), "dst": g.node_name(*v),
+                        "kind": g.kind_str(g.edge(*eid).kind_id), "delta": d,
+                    })
+                }).collect();
+                serde_json::json!({"fired": fired})
+            };
+            if r.adapt || r.trace {
+                let mut guard = db.engine.write().unwrap();
+                let e = &mut *guard;
+                let depth = r.depth.unwrap_or(e.layer.cfg.depth);
+                let fan = r.fan.unwrap_or(e.layer.cfg.fan);
+                let (mut res, tr) =
+                    e.layer.retrieve_traced(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
+                if r.adapt {
+                    res.lambda_scale = e.layer.observe(res.mass);
+                }
+                let explain = r.explain.then(|| explain_json(e.pg.graph(), &tr));
+                if r.trace {
+                    match e.traces.put(tr) {
+                        Ok(id) => {
+                            let mut body = serde_json::json!({"result": res, "trace_id": id});
+                            if let Some(x) = explain {
+                                body["explain"] = x;
+                            }
+                            json_resp(&body, 200)
+                        }
+                        Err(msg) => err(&format!("trace not persisted: {msg}"), 500),
+                    }
+                } else if let Some(x) = explain {
+                    json_resp(&serde_json::json!({"result": res, "explain": x}), 200)
+                } else {
+                    json_resp(&res, 200)
+                }
+            } else {
+                let e = db.engine.read().unwrap();
+                let depth = r.depth.unwrap_or(e.layer.cfg.depth);
+                let fan = r.fan.unwrap_or(e.layer.cfg.fan);
+                if r.explain {
+                    let (res, tr) =
+                        e.layer.retrieve_traced(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
+                    json_resp(&serde_json::json!({"result": res, "explain": explain_json(e.pg.graph(), &tr)}), 200)
+                } else {
+                    let res = e.layer.retrieve(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
+                    json_resp(&res, 200)
+                }
+            }
+        }
+        _ => {
+            // Everything below mutates the database.
+            if scope != Scope::Full {
+                return err("write scope required", 403);
+            }
+            // A wedged database (WAL write failed after in-memory apply)
+            // refuses writes; reads above keep serving.
+            if let Some(w) = db.engine.read().unwrap().wedged.clone() {
+                return err(
+                    &format!("database is wedged read-only (WAL write failed: {w}); restart the server after fixing the disk"),
+                    503,
+                );
+            }
+            let Some(key) = idem_key else {
+                return handle_db_write(reg, db, method, path, body).into_resp(false);
+            };
+            // Idempotent retry: replay the stored response for a repeated
+            // (endpoint, key); serialize concurrent duplicates.
+            let cache_key = format!("{method} {path} {key}");
+            {
+                let mut c = db.idem.lock().unwrap();
+                c.evict();
+                match c.map.get(&cache_key) {
+                    Some(IdemEntry::Done { code, body, .. }) => {
+                        return JsonOut { code: *code, body: body.clone() }.into_resp(true);
+                    }
+                    Some(IdemEntry::InFlight { at }) if at.elapsed() < IDEM_INFLIGHT_STALE => {
+                        return err("a request with this Idempotency-Key is already in flight", 409);
+                    }
+                    _ => {
+                        if !c.map.contains_key(&cache_key) {
+                            c.order.push_back(cache_key.clone());
+                        }
+                        c.map.insert(cache_key.clone(), IdemEntry::InFlight { at: Instant::now() });
+                    }
+                }
+            }
+            let out = handle_db_write(reg, db, method, path, body);
+            let mut c = db.idem.lock().unwrap();
+            if out.code < 500 {
+                // Cache final outcomes (2xx/4xx). 5xx are transient: the
+                // retry SHOULD reprocess, so drop the in-flight marker.
+                c.map.insert(
+                    cache_key,
+                    IdemEntry::Done { code: out.code, body: out.body.clone(), at: Instant::now() },
+                );
+            } else {
+                c.map.remove(&cache_key);
+                c.order.retain(|k| k != &cache_key);
+            }
+            drop(c);
+            out.into_resp(false)
+        }
+    }
+}
+
+fn handle_db_write(
+    reg: &Arc<Registry>,
+    db: &Arc<Db>,
+    method: &Method,
+    path: &str,
+    body: &str,
+) -> JsonOut {
+    match (method, path) {
+        (Method::Post, "/ingest") => {
+            let r: IngestReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
+            };
+            // Validate the payload BEFORE touching the store so bad input is
+            // a 400 and a failed ingest of valid input is a 500.
+            if r.cai {
+                #[cfg(feature = "gcp")]
+                if let Err(e) = psyrag_graph::gcp::parse_snapshot(&r.json) {
+                    return jerr(&format!("bad CAI snapshot: {e}"), 400);
+                }
+                #[cfg(not(feature = "gcp"))]
+                return jerr("built without gcp feature", 400);
+            } else if let Err(e) = psyrag_graph::entity::parse_entities(&r.json) {
+                return jerr(&format!("bad entities: {e}"), 400);
+            }
+            let ts = r.ts.unwrap_or_else(now_ms);
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            let res = if r.cai {
+                #[cfg(feature = "gcp")]
+                {
+                    e.pg.ingest_cai_snapshot(&r.json, ts)
+                }
+                #[cfg(not(feature = "gcp"))]
+                {
+                    Err("built without gcp feature".to_string())
+                }
+            } else {
+                e.pg.ingest_entities_from(&r.json, ts, r.reconcile, r.origin.as_deref())
+            };
+            match res {
+                Ok(stale) => {
+                    e.layer.sync(e.pg.graph());
+                    jout(&serde_json::json!({"stale_retired": stale, "edges": e.pg.graph().edge_count()}), 200)
+                }
+                Err(msg) => {
+                    // Ops may be applied in memory but unacked on disk:
+                    // memory/disk have diverged, so wedge read-only.
+                    e.wedge(&msg);
+                    jerr(&format!("ingest failed mid-write; database wedged read-only: {msg}"), 500)
+                }
+            }
+        }
+        (Method::Post, "/touch") => {
+            let r: TouchReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
+            };
+            let ts = r.ts.unwrap_or_else(now_ms);
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            let mut touches = Vec::new();
+            let mut missed = 0;
+            for (s, d, k, rr) in &r.edges {
+                match e.layer.edge_id(e.pg.graph(), s, d, k) {
+                    Some(eid) => touches.push((eid, *rr)),
+                    None => missed += 1,
+                }
+            }
+            e.layer.touch(&touches, ts);
+            jout(&serde_json::json!({"touched": touches.len(), "missed": missed}), 200)
+        }
+        (Method::Post, "/feedback") => {
+            let r: FeedbackReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
+            };
+            let ts = r.ts.unwrap_or_else(now_ms);
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            // build the Credit (nodes > reward > used)
+            let hit = e.layer.cfg.feedback_hit;
+            let credit = if let Some(nodes) = r.nodes.clone() {
+                Credit::Nodes(nodes)
+            } else if let Some(reward) = r.reward {
+                Credit::Episodic { reward, spread: r.spread.unwrap_or(Spread::ByActivation) }
+            } else if let Some(used) = r.used.clone() {
+                Credit::Nodes(used.into_iter().map(|n| (n, hit)).collect())
+            } else {
+                return jerr("feedback needs one of: nodes, reward, used", 400);
+            };
+            // get the trace: deferred (trace_id) or stateless (recompute)
+            let trace = if let Some(id) = r.trace_id {
+                match e.traces.get(id) {
+                    Some(t) => t,
+                    None => return jerr("unknown trace_id (evicted or never issued)", 404),
+                }
+            } else if let Some(seeds) = r.seeds.clone() {
+                let sref: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+                let depth = r.depth.unwrap_or(e.layer.cfg.depth);
+                let fan = r.fan.unwrap_or(e.layer.cfg.fan);
+                let (_res, tr) = e.layer.retrieve_traced(e.pg.graph(), &sref, depth, fan, r.top_k, ts);
+                tr
+            } else {
+                return jerr("feedback needs trace_id or seeds", 400);
+            };
+            let report = e.layer.apply_credit(e.pg.graph(), &trace, &credit, ts);
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("feedback applied but not persisted: {msg}"), 500);
+            }
+            jout(&report, 200)
+        }
         (Method::Post, "/sleep") => {
             let ts: i64 = serde_json::from_str::<serde_json::Value>(body)
                 .ok()
                 .and_then(|v| v.get("ts").and_then(|x| x.as_i64()))
                 .unwrap_or_else(now_ms);
-            let mut guard = engine.lock().unwrap();
+            let mut guard = db.engine.write().unwrap();
             let e = &mut *guard;
             let rep = {
                 let g = e.pg.graph();
                 e.layer.sleep(g, ts)
             };
-            let _ = e.layer.save(&e.sidecar_path);
-            json_resp(&rep, 200)
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("sleep ran but not persisted: {msg}"), 500);
+            }
+            jout(&rep, 200)
+        }
+        (Method::Post, "/checkpoint") => {
+            #[derive(Deserialize)]
+            struct CheckpointReq {
+                #[serde(default = "d_true")]
+                archive: bool,
+            }
+            let r: CheckpointReq = if body.trim().is_empty() {
+                CheckpointReq { archive: true }
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(r) => r,
+                    Err(e) => return jerr(&format!("bad body: {e}"), 400),
+                }
+            };
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            let report = match e.pg.compact(r.archive) {
+                Ok(rep) => rep,
+                Err(msg) => {
+                    // Compaction failures can leave the writer mid-swap;
+                    // wedge rather than risk appending to the wrong file.
+                    e.wedge(&msg);
+                    return jerr(&format!("checkpoint failed; database wedged read-only: {msg}"), 500);
+                }
+            };
+            // Sidecar v2 keys are stable across the renumbering the next
+            // replay performs, so saving against the (old-id) in-memory
+            // graph is correct.
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("checkpoint done but sidecar not persisted: {msg}"), 500);
+            }
+            // Outstanding traces reference pre-compaction dense ids.
+            if let Err(msg) = e.traces.clear() {
+                return jerr(&format!("checkpoint done but trace log not cleared: {msg}"), 500);
+            }
+            jout(&serde_json::json!({
+                "report": report,
+                "traces_cleared": true,
+                "note": "in-memory graph keeps full history until restart; the on-disk log is compacted",
+            }), 200)
+        }
+        (Method::Post, "/quarantine") => {
+            #[derive(Deserialize)]
+            struct QuarantineReq {
+                origin_prefix: String,
+                /// 0.0 = fully quarantined; 1.0 (or removing the entry via
+                /// config) = restored. Retrieval-time mask only.
+                #[serde(default)]
+                trust: f32,
+            }
+            let r: QuarantineReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
+            };
+            if r.origin_prefix.is_empty() {
+                return jerr("origin_prefix must be non-empty", 400);
+            }
+            if !r.trust.is_finite() || r.trust < 0.0 {
+                return jerr("trust must be a finite number >= 0", 400);
+            }
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            e.layer.set_trust(e.pg.graph(), &r.origin_prefix, r.trust);
+            // Persist into the DB's config.json so trust survives restarts
+            // (multi-DB mode; legacy mode applies in-memory only).
+            let persisted = match &db.cfg_path {
+                Some(cp) => {
+                    let s = serde_json::to_string_pretty(&e.layer.cfg).unwrap_or_default();
+                    match std::fs::write(cp, s) {
+                        Ok(()) => true,
+                        Err(er) => {
+                            return jerr(&format!("trust applied but config not persisted: {er}"), 500)
+                        }
+                    }
+                }
+                None => false,
+            };
+            jout(&serde_json::json!({
+                "origin_prefix": r.origin_prefix,
+                "trust": r.trust,
+                "persisted": persisted,
+            }), 200)
+        }
+        (Method::Post, "/purge") => {
+            #[derive(Deserialize)]
+            struct PurgeReq {
+                origin_prefix: String,
+            }
+            // Purging is irreversible content deletion; like DELETE /db it
+            // is disabled unless the operator opted into authentication.
+            if reg.opts.token.is_none() {
+                return jerr("POST /purge is disabled unless the server runs with --token", 403);
+            }
+            let r: PurgeReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
+            };
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            // EdgeIds renumber: carry learned state across by stable key.
+            let snap = e.layer.snapshot_keys(e.pg.graph());
+            let report = match e.pg.purge(&r.origin_prefix) {
+                Ok(rep) => rep,
+                Err(msg) => {
+                    e.wedge(&msg);
+                    return jerr(&format!("purge failed; database wedged read-only: {msg}"), 500);
+                }
+            };
+            e.layer.restore_keys(e.pg.graph(), &snap);
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("purge done but sidecar not persisted: {msg}"), 500);
+            }
+            if let Err(msg) = e.traces.clear() {
+                return jerr(&format!("purge done but trace log not cleared: {msg}"), 500);
+            }
+            jout(&serde_json::json!({"report": report, "traces_cleared": true}), 200)
         }
         (Method::Post, "/consolidate") => {
             let r: ConsolidateReq = if body.trim().is_empty() {
@@ -344,11 +1121,12 @@ fn handle(
             } else {
                 match serde_json::from_str(body) {
                     Ok(r) => r,
-                    Err(e) => return err(&format!("bad body: {e}"), 400),
+                    Err(e) => return jerr(&format!("bad body: {e}"), 400),
                 }
             };
             let ts = r.ts.unwrap_or_else(now_ms);
-            let mut guard = engine.lock().unwrap(); let e = &mut *guard;
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
             let (stats, conflicts) = {
                 let g = e.pg.graph();
                 e.layer.consolidate(g, ts)
@@ -358,20 +1136,24 @@ fn handle(
             if r.apply_conflicts {
                 for c in &conflicts {
                     for op in &c.superseded {
-                        if e.pg.record_op(op.clone()).is_ok() {
-                            applied += 1;
+                        if let Err(msg) = e.pg.record_op(op.clone()) {
+                            e.wedge(&msg);
+                            return jerr(&format!("conflict op not journaled; database wedged read-only: {msg}"), 500);
                         }
+                        applied += 1;
                     }
                 }
-                let _ = e.pg.flush();
+                if let Err(msg) = e.pg.flush() {
+                    e.wedge(&msg);
+                    return jerr(&format!("conflict ops not persisted; database wedged read-only: {msg}"), 500);
+                }
                 e.layer.sync(e.pg.graph());
             }
-            let _ = e.layer.save(&e.sidecar_path);
-            json_resp(&serde_json::json!({"stats": stats, "conflicts": conflicts, "applied_ops": applied}), 200)
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("consolidation ran but not persisted: {msg}"), 500);
+            }
+            jout(&serde_json::json!({"stats": stats, "conflicts": conflicts, "applied_ops": applied}), 200)
         }
-        (Method::Get, "/") => Response::from_string(UI_HTML)
-            .with_status_code(200)
-            .with_header("Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>().unwrap()),
-        _ => err("not found", 404),
+        _ => jerr("not found", 404),
     }
 }

@@ -85,6 +85,13 @@ pub struct Config {
     pub authority_by_kind: HashMap<String, f32>,
     pub authority_default: f32,
 
+    /// Trust level per provenance-origin PREFIX (longest match wins;
+    /// unlisted origins and unlabeled facts get 1.0). Applied as a
+    /// retrieval-time multiplier on edge salience — 0.0 quarantines a
+    /// source's influence entirely. A retrieval MASK like the dead bit:
+    /// stored weights are untouched, so restoring trust restores recall.
+    pub trust_by_origin: HashMap<String, f32>,
+
     /// Edge kinds that are *functional* (single-valued): a source may have at
     /// most one open edge of this kind. Only these are checked for ground-truth
     /// contradictions during consolidation. Multi-valued predicates (CONNECTS,
@@ -140,6 +147,7 @@ impl Default for Config {
             norm_target: 1.0,
             authority_by_kind: HashMap::new(),
             authority_default: 0.0,
+            trust_by_origin: HashMap::new(),
             functional_kinds: std::collections::HashSet::new(),
             feedback_gamma: 0.5,
             feedback_hit: 1.0,
@@ -216,6 +224,8 @@ pub struct NodeAct {
     pub node: String,
     pub node_type: String,
     pub activation: f32,
+    /// Provenance of the node's current version ("" = none recorded).
+    pub origin: String,
 }
 
 /// One edge that carried activation during a retrieval (hop order).
@@ -352,8 +362,18 @@ pub struct PlasticityLayer {
     t_last: Vec<Ts>,
     neg_lambda: Vec<f32>,
     dead: Vec<bool>,
+    /// Retrieval-time trust multiplier per edge (from `trust_by_origin`);
+    /// derived from graph provenance + config, never persisted.
+    trust: Vec<f32>,
 
     lambda_scale: AtomicU32,
+
+    /// WAL binding stamped into saves: (wal lineage id, LSN as-of). Set by
+    /// the engine before each save; None = unbound (tests, legacy).
+    wal_binding: Option<(String, u64)>,
+    /// The (wal_id, lsn) the last loaded snapshot was saved at, for
+    /// verify-style reporting of the learning gap.
+    pub loaded_binding: Option<(String, u64)>,
 }
 
 impl PlasticityLayer {
@@ -366,8 +386,20 @@ impl PlasticityLayer {
             t_last: Vec::new(),
             neg_lambda: Vec::new(),
             dead: Vec::new(),
+            trust: Vec::new(),
             lambda_scale: AtomicU32::new(1.0f32.to_bits()),
+            wal_binding: None,
+            loaded_binding: None,
         }
+    }
+
+    /// Bind subsequent saves to a WAL epoch: snapshots record which log (and
+    /// how far into it) the learned state corresponds to. Touches/feedback
+    /// are NOT journaled, so learning past a snapshot's LSN is lost on
+    /// crash — the binding makes that gap detectable and reportable instead
+    /// of silent.
+    pub fn set_wal_binding(&mut self, wal_id: Option<&str>, lsn: u64) {
+        self.wal_binding = wal_id.map(|id| (id.to_string(), lsn));
     }
 
     #[inline]
@@ -377,6 +409,25 @@ impl PlasticityLayer {
     #[inline]
     pub fn set_lambda_scale(&self, s: f32) {
         self.lambda_scale.store(s.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Trust multiplier for an edge from its provenance origin: longest
+    /// matching prefix in `trust_by_origin`, else 1.0.
+    fn trust_of(&self, g: &TemporalGraph, eid: EdgeId) -> f32 {
+        if self.cfg.trust_by_origin.is_empty() {
+            return 1.0;
+        }
+        let origin = g.edge_origin(eid);
+        if origin.is_empty() {
+            return 1.0;
+        }
+        self.cfg
+            .trust_by_origin
+            .iter()
+            .filter(|(prefix, _)| origin.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, t)| t.max(0.0))
+            .unwrap_or(1.0)
     }
 
     /// Grow the sidecar to cover every edge in the graph. New edges are seeded
@@ -397,7 +448,29 @@ impl PlasticityLayer {
             self.t_last.push(e.valid_from);
             self.neg_lambda.push(-lam);
             self.dead.push(false);
+            self.trust.push(self.trust_of(g, eid as EdgeId));
         }
+    }
+
+    /// Recompute the whole trust column from graph provenance + config. Call
+    /// after changing `trust_by_origin` (e.g. a quarantine). O(edges).
+    pub fn resync_trust(&mut self, g: &TemporalGraph) {
+        let n = self.w.len().min(g.edge_count());
+        self.trust.resize(n, 1.0);
+        for eid in 0..n {
+            self.trust[eid] = self.trust_of(g, eid as EdgeId);
+        }
+    }
+
+    /// Set (or update) a trust level for an origin prefix and re-resolve the
+    /// per-edge mask. `trust = 0.0` quarantines the source; removing the
+    /// entry later (or setting 1.0) restores its influence — stored weights
+    /// are never modified by trust.
+    pub fn set_trust(&mut self, g: &TemporalGraph, origin_prefix: &str, trust: f32) {
+        self.cfg
+            .trust_by_origin
+            .insert(origin_prefix.to_string(), trust.max(0.0));
+        self.resync_trust(g);
     }
 
     #[inline]
@@ -410,17 +483,32 @@ impl PlasticityLayer {
         self.w[i] * (self.neg_lambda[i] * scale * dt).exp()
     }
 
-    /// True current retrieval weight of an edge (pure read).
+    /// Trust-masked salience: raw decayed weight x provenance trust. This is
+    /// what retrieval sees; state maintenance (touch/consolidate/sleep) uses
+    /// the raw weight so a quarantine never destroys learned state.
+    #[inline]
+    fn eff_trusted(&self, eid: EdgeId, t_now: Ts, scale: f32) -> f32 {
+        let t = self.trust.get(eid as usize).copied().unwrap_or(1.0);
+        if t <= 0.0 {
+            return 0.0;
+        }
+        self.eff(eid, t_now, scale) * t
+    }
+
+    /// True current retrieval weight of an edge (pure read, trust-masked).
     pub fn effective_weight(&self, eid: EdgeId, t_now: Ts) -> f32 {
-        self.eff(eid, t_now, self.lambda_scale())
+        self.eff_trusted(eid, t_now, self.lambda_scale())
     }
 
     /// Reinforce edges: decay-to-now then add alpha*clip(R). Batch write.
+    /// Non-finite R (NaN/inf from a bad client or parse) is dropped, never
+    /// written: `NaN.clamp()` is NaN and a single NaN weight would poison
+    /// every retrieval sort downstream.
     pub fn touch(&mut self, touches: &[(EdgeId, f32)], t_now: Ts) {
         let scale = self.lambda_scale();
         for &(eid, r) in touches {
             let i = eid as usize;
-            if i >= self.w.len() || self.dead[i] {
+            if i >= self.w.len() || self.dead[i] || !r.is_finite() {
                 continue;
             }
             let decayed = self.eff(eid, t_now, scale);
@@ -498,7 +586,7 @@ impl PlasticityLayer {
                 for &eid in g.out_edge_ids(u) {
                     let e = g.edge(eid);
                     if e.alive_at(t_now) {
-                        out_mass += self.eff(eid, t_now, scale).max(0.0);
+                        out_mass += self.eff_trusted(eid, t_now, scale).max(0.0);
                     }
                 }
                 if out_mass <= 0.0 {
@@ -511,7 +599,7 @@ impl PlasticityLayer {
                     if !e.alive_at(t_now) {
                         continue;
                     }
-                    let we = self.eff(eid, t_now, scale).max(0.0);
+                    let we = self.eff_trusted(eid, t_now, scale).max(0.0);
                     let v = e.dst as usize;
                     let delta = outflow * (we / out_mass);
                     if delta > eps {
@@ -536,7 +624,7 @@ impl PlasticityLayer {
             .filter(|(_, &a)| a > 0.0)
             .map(|(i, &a)| (i as NodeId, a))
             .collect();
-        pairs.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
+        pairs.sort_by(|x, y| y.1.total_cmp(&x.1));
         pairs.truncate(top_k);
         let surfaced: Vec<(NodeId, f32)> = pairs.iter().map(|(id, a)| (*id, *a)).collect();
         let top = pairs
@@ -545,6 +633,7 @@ impl PlasticityLayer {
                 node: g.node_name(id).to_string(),
                 node_type: g.node_type(id).to_string(),
                 activation: a,
+                origin: g.node_origin_at(id, t_now).to_string(),
             })
             .collect();
         (
@@ -905,7 +994,7 @@ impl PlasticityLayer {
         let live_before = live_idx.len().max(1);
         // 2. protection threshold = (1 - frac) quantile of live weights
         let mut sorted: Vec<f32> = live_idx.iter().map(|&i| self.w[i]).collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(f32::total_cmp);
         let frac = self.cfg.protect_top_frac.clamp(0.0, 1.0);
         let q = ((1.0 - frac) * (sorted.len().saturating_sub(1)) as f32).round() as usize;
         let protect_thr = if sorted.is_empty() { f32::MAX } else { sorted[q.min(sorted.len() - 1)] };
@@ -996,36 +1085,164 @@ impl PlasticityLayer {
     }
 
     /// Serialize the sidecar (weights, last-touch times, per-edge lambda, dead
-    /// mask, homeostat, scale) to JSON. EdgeIds are stable across WAL replay, so
-    /// this composes with the on-disk WAL. Call `sync` after `load` to cover any
-    /// edges appended since the snapshot.
-    pub fn save(&self, path: &str) -> Result<(), String> {
+    /// mask, homeostat, scale) to JSON, format v2: every entry carries a
+    /// **stable edge key** — an FNV-1a hash of `(src, dst, kind, valid_from)` —
+    /// so the snapshot survives WAL compaction/rewrites that renumber the
+    /// dense `EdgeId`s. Call `sync` after `load` to cover any edges appended
+    /// since the snapshot.
+    ///
+    /// The write is atomic (temp file + fsync + rename): a crash mid-save
+    /// leaves the previous snapshot intact, never a truncated one.
+    pub fn save(&self, g: &TemporalGraph, path: &str) -> Result<(), String> {
+        use std::io::Write as _;
+        let n = self.w.len().min(g.edge_count());
+        let keys: Vec<u64> = (0..n).map(|i| stable_edge_key(g, i as EdgeId)).collect();
         let p = Persisted {
-            w: &self.w,
-            t_last: &self.t_last,
-            neg_lambda: &self.neg_lambda,
-            dead: &self.dead,
+            psyrag_sidecar: 2,
+            wal_id: self.wal_binding.as_ref().map(|(id, _)| id.as_str()),
+            wal_lsn: self.wal_binding.as_ref().map(|(_, l)| *l),
+            keys,
+            w: &self.w[..n],
+            t_last: &self.t_last[..n],
+            neg_lambda: &self.neg_lambda[..n],
+            dead: &self.dead[..n],
             lambda_scale: self.lambda_scale(),
             homeo: &self.homeo,
         };
         let s = serde_json::to_string(&p).map_err(|e| e.to_string())?;
-        std::fs::write(path, s).map_err(|e| e.to_string())
+        let tmp = format!("{path}.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {tmp}: {e}"))?;
+            f.write_all(s.as_bytes())
+                .map_err(|e| format!("write {tmp}: {e}"))?;
+            f.sync_all().map_err(|e| format!("fsync {tmp}: {e}"))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp} -> {path}: {e}"))?;
+        // Persist the rename itself (directory entry), best-effort.
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
 
     /// Load a sidecar snapshot if the file exists (no-op if absent).
-    pub fn load_if_exists(&mut self, path: &str) -> Result<(), String> {
+    ///
+    /// v2 snapshots are resolved by stable edge key against the *current*
+    /// graph — entries follow their edge across WAL compaction; entries whose
+    /// edge no longer exists are dropped; edges with no entry seed fresh
+    /// (as in `sync`). Legacy v1 (keyless, positional) snapshots load
+    /// positionally, which is valid precisely because pre-v2 WALs were never
+    /// compacted.
+    pub fn load_if_exists(&mut self, g: &TemporalGraph, path: &str) -> Result<(), String> {
         if !std::path::Path::new(path).exists() {
             return Ok(());
         }
         let s = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let p: PersistedOwned = serde_json::from_str(&s).map_err(|e| e.to_string())?;
-        self.w = p.w;
-        self.t_last = p.t_last;
-        self.neg_lambda = p.neg_lambda;
-        self.dead = p.dead;
+        if p.psyrag_sidecar > 2 {
+            return Err(format!(
+                "sidecar {path} is format v{}, newer than this binary understands (max v2) —                  upgrade psyrag or restore the pre-upgrade backup",
+                p.psyrag_sidecar
+            ));
+        }
+        // A sidecar bound to a DIFFERENT WAL lineage is a copy/restore
+        // mistake: refuse loudly rather than let stable keys silently
+        // cross-pollinate two databases that happen to share edge names.
+        if let (Some(ours), Some((theirs, _))) =
+            (&p.wal_id, self.wal_binding.as_ref())
+        {
+            if ours != theirs {
+                return Err(format!(
+                    "sidecar {path} belongs to WAL {ours}, not this WAL {theirs} —                      wrong file? (delete it to start learning fresh)"
+                ));
+            }
+        }
+        self.loaded_binding = p.wal_id.clone().zip(p.wal_lsn);
+        match p.keys {
+            Some(keys) => {
+                if keys.len() != p.w.len() {
+                    return Err(format!(
+                        "sidecar {path}: keys/weights length mismatch ({} vs {})",
+                        keys.len(),
+                        p.w.len()
+                    ));
+                }
+                let by_key: HashMap<u64, usize> =
+                    keys.iter().enumerate().map(|(i, &k)| (k, i)).collect();
+                // Seed every current edge fresh, then overlay matched state.
+                self.w.clear();
+                self.t_last.clear();
+                self.neg_lambda.clear();
+                self.dead.clear();
+                self.sync(g);
+                for eid in 0..g.edge_count() {
+                    if let Some(&i) = by_key.get(&stable_edge_key(g, eid as EdgeId)) {
+                        self.w[eid] = p.w[i];
+                        self.t_last[eid] = p.t_last[i];
+                        self.neg_lambda[eid] = p.neg_lambda[i];
+                        self.dead[eid] = p.dead[i];
+                    }
+                }
+            }
+            None => {
+                // v1: positional columns.
+                self.w = p.w;
+                self.t_last = p.t_last;
+                self.neg_lambda = p.neg_lambda;
+                self.dead = p.dead;
+            }
+        }
         self.set_lambda_scale(p.lambda_scale);
         self.homeo = p.homeo;
+        // Trust is derived state; rebuild it for whatever columns we now have
+        // (the v1 positional path bypasses sync's incremental growth).
+        self.resync_trust(g);
         Ok(())
+    }
+
+    /// A keyed snapshot of the sidecar columns for rebuilding after an
+    /// operation that renumbers EdgeIds in-process (purge). Pair with
+    /// `restore_keys` against the post-renumbering graph.
+    pub fn snapshot_keys(&self, g: &TemporalGraph) -> Vec<(u64, f32, Ts, f32, bool)> {
+        let n = self.w.len().min(g.edge_count());
+        (0..n)
+            .map(|i| {
+                (
+                    stable_edge_key(g, i as EdgeId),
+                    self.w[i],
+                    self.t_last[i],
+                    self.neg_lambda[i],
+                    self.dead[i],
+                )
+            })
+            .collect()
+    }
+
+    /// Rebuild the columns against `g`, carrying over state by stable key.
+    /// Entries whose edge no longer exists are dropped (that is the point,
+    /// after a purge); new edges seed fresh.
+    pub fn restore_keys(&mut self, g: &TemporalGraph, snap: &[(u64, f32, Ts, f32, bool)]) {
+        let by_key: HashMap<u64, usize> =
+            snap.iter().enumerate().map(|(i, e)| (e.0, i)).collect();
+        self.w.clear();
+        self.t_last.clear();
+        self.neg_lambda.clear();
+        self.dead.clear();
+        self.trust.clear();
+        self.sync(g);
+        for eid in 0..g.edge_count() {
+            if let Some(&i) = by_key.get(&stable_edge_key(g, eid as EdgeId)) {
+                let (_, w, t_last, neg_lambda, dead) = snap[i];
+                self.w[eid] = w;
+                self.t_last[eid] = t_last;
+                self.neg_lambda[eid] = neg_lambda;
+                self.dead[eid] = dead;
+            }
+        }
     }
 
     /// Resolve an edge id from endpoint names + kind (for touch by name).
@@ -1042,9 +1259,41 @@ impl PlasticityLayer {
     }
 }
 
-// Borrowed view for zero-copy save; owned mirror for load.
+/// Stable, process-independent identity of an edge: FNV-1a 64 over
+/// `src \0 dst \0 kind \0 valid_from`. Dense `EdgeId`s renumber whenever the
+/// WAL is compacted; this key follows the fact itself (`valid_from` is
+/// preserved by compaction, and distinguishes re-observations of the same
+/// triple). Collisions at realistic edge counts are ~2^-64-scale noise; a
+/// collision merely makes two edges share persisted salience state.
+pub fn stable_edge_key(g: &TemporalGraph, eid: EdgeId) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let e = g.edge(eid);
+    let mut h = FNV_OFFSET;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    eat(g.node_name(e.src).as_bytes());
+    eat(&[0]);
+    eat(g.node_name(e.dst).as_bytes());
+    eat(&[0]);
+    eat(g.kind_str(e.kind_id).as_bytes());
+    eat(&[0]);
+    eat(&e.valid_from.to_le_bytes());
+    h
+}
+
+// Borrowed view for zero-copy save; owned mirror for load. `keys` (v2) maps
+// each column entry to its stable edge key; absent = legacy v1 positional.
 #[derive(Serialize)]
 struct Persisted<'a> {
+    psyrag_sidecar: u32,
+    wal_id: Option<&'a str>,
+    wal_lsn: Option<u64>,
+    keys: Vec<u64>,
     w: &'a [f32],
     t_last: &'a [Ts],
     neg_lambda: &'a [f32],
@@ -1054,6 +1303,14 @@ struct Persisted<'a> {
 }
 #[derive(Deserialize)]
 struct PersistedOwned {
+    #[serde(default)]
+    psyrag_sidecar: u32,
+    #[serde(default)]
+    wal_id: Option<String>,
+    #[serde(default)]
+    wal_lsn: Option<u64>,
+    #[serde(default)]
+    keys: Option<Vec<u64>>,
     w: Vec<f32>,
     t_last: Vec<Ts>,
     neg_lambda: Vec<f32>,
@@ -1291,6 +1548,142 @@ mod tests {
         assert!(p.effective_weight(ha, 100 * S) > 0.0, "consolidated edge survives");
         assert!(p.effective_weight(he, 100 * S) == 0.0, "weak edge pruned in sleep");
         assert!(rep.protected >= 1 && rep.pruned >= 1);
+    }
+
+    #[test]
+    fn quarantine_masks_and_restores_without_touching_weights() {
+        // hub -> tainted (origin evil:1), hub -> clean (no origin).
+        let json = r#"[
+            {"name":"hub","type":"t","edges":[{"dst":"clean","kind":"REL"}]},
+            {"name":"hub","type":"t","origin":"evil:1","edges":[
+                {"dst":"clean","kind":"REL"},{"dst":"tainted","kind":"BAD"}]}
+        ]"#;
+        // (second record re-observes hub; its new BAD edge carries evil:1)
+        let mut g = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g, json, 0, false).unwrap();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg);
+        p.sync(&g);
+        let bad = p.edge_id(&g, "hub", "tainted", "BAD").unwrap();
+        assert!(p.effective_weight(bad, 1 * S) > 0.0, "visible before quarantine");
+        let r0 = p.retrieve(&g, &["hub"], 1, 0.9, 10, 1 * S);
+        assert!(r0.top.iter().any(|n| n.node == "tainted"));
+
+        p.set_trust(&g, "evil:", 0.0);
+        assert_eq!(p.effective_weight(bad, 1 * S), 0.0, "masked");
+        let r1 = p.retrieve(&g, &["hub"], 1, 0.9, 10, 1 * S);
+        assert!(
+            !r1.top.iter().any(|n| n.node == "tainted"),
+            "quarantined source's influence gone: {:?}",
+            r1.top
+        );
+        // clean edge unaffected
+        assert!(r1.top.iter().any(|n| n.node == "clean"));
+
+        // Restore: the stored weight was never modified.
+        p.set_trust(&g, "evil:", 1.0);
+        assert!(p.effective_weight(bad, 1 * S) > 0.0, "restored, not destroyed");
+    }
+
+    #[test]
+    fn retrieval_reports_node_origin() {
+        let json = r#"[{"name":"src","type":"t","origin":"sess:42",
+            "edges":[{"dst":"other","kind":"REL"}]}]"#;
+        let mut g = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g, json, 0, false).unwrap();
+        let mut p = PlasticityLayer::new(Config::default());
+        p.sync(&g);
+        let r = p.retrieve(&g, &["src"], 1, 0.9, 10, 1 * S);
+        let src = r.top.iter().find(|n| n.node == "src").unwrap();
+        assert_eq!(src.origin, "sess:42");
+    }
+
+    #[test]
+    fn sidecar_v2_roundtrip_restores_state() {
+        let g = seed_graph();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg.clone());
+        p.sync(&g);
+        let ha = p.edge_id(&g, "hub", "a", "CALLS").unwrap();
+        p.touch(&[(ha, 1.0)], 5 * S);
+        let w_before = p.effective_weight(ha, 5 * S);
+        let path = std::env::temp_dir().join("psyrag_sc_v2.json");
+        let path = path.to_str().unwrap();
+        p.save(&g, path).unwrap();
+        let mut q = PlasticityLayer::new(cfg);
+        q.load_if_exists(&g, path).unwrap();
+        q.sync(&g);
+        assert!((q.effective_weight(ha, 5 * S) - w_before).abs() < 1e-6);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidecar_v2_survives_edge_renumbering() {
+        // Save against a graph with edges [x->gone, x->keep]; reload against a
+        // "compacted" graph where `gone` was dropped, so keep's EdgeId shifts
+        // from 1 to 0. The learned weight must follow the edge, not the index.
+        let json_full = r#"[{"name":"x","type":"t","edges":[
+            {"dst":"gone","kind":"CALLS"},{"dst":"keep","kind":"CALLS"}]}]"#;
+        let mut g1 = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g1, json_full, 0, false).unwrap();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg.clone());
+        p.sync(&g1);
+        let keep1 = p.edge_id(&g1, "x", "keep", "CALLS").unwrap();
+        assert_eq!(keep1, 1, "test setup: keep is the second edge");
+        p.touch(&[(keep1, 1.0)], 1 * S);
+        let w_learned = p.effective_weight(keep1, 1 * S);
+        let path = std::env::temp_dir().join("psyrag_sc_renum.json");
+        let path = path.to_str().unwrap();
+        p.save(&g1, path).unwrap();
+
+        // Compacted world: only the open x->keep edge (same valid_from=0).
+        let json_compact = r#"[{"name":"x","type":"t","edges":[
+            {"dst":"keep","kind":"CALLS"}]}]"#;
+        let mut g2 = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g2, json_compact, 0, false).unwrap();
+        let mut q = PlasticityLayer::new(cfg);
+        q.load_if_exists(&g2, path).unwrap();
+        q.sync(&g2);
+        let keep2 = q.edge_id(&g2, "x", "keep", "CALLS").unwrap();
+        assert_eq!(keep2, 0, "renumbered after compaction");
+        assert!(
+            (q.effective_weight(keep2, 1 * S) - w_learned).abs() < 1e-6,
+            "state followed the stable key across renumbering"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidecar_v1_legacy_loads_positionally() {
+        let g = seed_graph();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg.clone());
+        p.sync(&g);
+        let n = g.edge_count();
+        // Hand-craft a v1 (keyless) snapshot: edge 0 carries weight 0.77.
+        let mut w = vec![0.5f32; n];
+        w[0] = 0.77;
+        let v1 = serde_json::json!({
+            "w": w,
+            "t_last": vec![0i64; n],
+            "neg_lambda": vec![0.0f32; n],
+            "dead": vec![false; n],
+            "lambda_scale": 1.0,
+            "homeo": serde_json::to_value(&p.homeo).unwrap(),
+        });
+        let path = std::env::temp_dir().join("psyrag_sc_v1.json");
+        let path = path.to_str().unwrap();
+        std::fs::write(path, v1.to_string()).unwrap();
+        let mut q = PlasticityLayer::new(cfg);
+        q.load_if_exists(&g, path).unwrap();
+        q.sync(&g);
+        assert!((q.effective_weight(0, 1 * S) - 0.77).abs() < 1e-6);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

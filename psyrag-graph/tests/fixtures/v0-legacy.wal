@@ -1,0 +1,5 @@
+{"op":"observe_node","name":"x","asset_type":"t/x","props":{"k":1},"ts":1000}
+{"op":"observe_placeholder","name":"y","inferred_type":"t/y","ts":1000}
+{"op":"observe_edge","src":"x","dst":"y","kind":"CALLS","ts":1000}
+{"op":"observe_node","name":"y","asset_type":"t/y","props":null,"ts":1000}
+{"op":"observe_edge","src":"y","dst":"z","kind":"REFS","ts":1000}

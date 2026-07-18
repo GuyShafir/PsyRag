@@ -130,10 +130,33 @@ What has to be indexed, and how it maps to a backend:
 
 ## Durability
 
-- **WAL** (`<wal>`) — the graph facts (NDJSON of ops), replayed on open.
-- **Sidecar** (`<wal>.psyrag.json`) — plasticity weights, decay state, homeostat.
-- **Trace log** (`<sidecar>.traces.jsonl`) — durable retrieval traces for deferred
-  feedback; bounded FIFO with compaction, survives restarts.
+- **WAL** (`<wal>`) — the graph facts, one CRC32-framed JSON op per line
+  (`#psyrag-wal:v1` header; legacy plain-NDJSON logs replay transparently).
+  Replayed on open; fsynced at batch boundaries; held under an exclusive
+  `flock` so exactly one process writes it. A torn final record is truncated
+  and recovered; mid-file corruption refuses to open (dense `EdgeId`s mean a
+  silent skip would misalign the entire sidecar).
+- **Sidecar** (`<wal>.psyrag.json`) — plasticity weights, decay state,
+  homeostat. Written atomically (temp + fsync + rename): a crash mid-save
+  leaves the previous snapshot intact. Entries are keyed by a stable edge key
+  (FNV-1a of `src, dst, kind, valid_from`) rather than the dense `EdgeId`, so
+  learned state survives WAL compaction.
+- **Trace log** (`<sidecar>.traces.jsonl`) — durable retrieval traces for
+  deferred feedback; fsynced per store, bounded FIFO with atomic compaction,
+  survives restarts.
 
-All three live under one directory; mount it as a volume (Docker) or back it with
-AlloyDB to persist learned state and pending deferred credit across restarts.
+A 2xx from a mutating HTTP endpoint means the change is on disk; persistence
+failures surface as 5xx. `psyrag serve` drains in-flight requests and flushes
+every open database on SIGINT/SIGTERM.
+
+**Checkpointing.** The WAL is append-only and would otherwise grow without
+bound; `checkpoint` (CLI or `POST /checkpoint`) rewrites it to just the ops
+that reconstruct current open state — original timestamps preserved — and
+archives the old log (`<wal>.archive-<ms>`), which doubles as cold history
+and an incremental backup unit. Replay time is proportional to the working
+set, not to all history ever written.
+
+All three files live under one directory per database; in multi-DB mode
+(`--data-dir`) each database is one such directory. Mount it as a volume
+(Docker) or back it with AlloyDB to persist learned state and pending
+deferred credit across restarts.

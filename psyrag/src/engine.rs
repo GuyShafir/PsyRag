@@ -15,10 +15,44 @@ pub struct Engine {
     pub layer: PlasticityLayer,
     pub sidecar_path: String,
     pub traces: TraceStore,
+    /// Set when a WAL write/flush failed AFTER ops were applied in memory:
+    /// memory and disk have diverged and we cannot un-apply. The database
+    /// stays readable but refuses further writes until restart (which
+    /// replays only what the WAL acked). Holds the original error.
+    pub wedged: Option<String>,
 }
 
+impl Engine {
+    /// Persist the sidecar stamped with the WAL epoch it is as-of
+    /// (wal_id + LSN). All sidecar saves go through here so the binding
+    /// can never be forgotten.
+    pub fn save_sidecar(&mut self) -> Result<(), String> {
+        let lsn = self.pg.lsn();
+        let id = self.pg.wal_id().map(|s| s.to_string());
+        self.layer.set_wal_binding(id.as_deref(), lsn);
+        self.layer.save(self.pg.graph(), &self.sidecar_path)
+    }
+
+    /// Record a WAL-write failure: wedge the database read-only.
+    pub fn wedge(&mut self, err: &str) {
+        if self.wedged.is_none() {
+            self.wedged = Some(err.to_string());
+        }
+    }
+}
+
+/// Wall-clock millis, ratcheted monotonic: a backwards clock jump (NTP step,
+/// manual reset) returns the last value seen instead of going back in time.
+/// Decay math tolerates dt=0; it does not tolerate `t_last` in the future
+/// (decay silently freezes until the clock catches up).
 pub fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    LAST.fetch_max(wall, Ordering::Relaxed).max(wall)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,16 +110,23 @@ impl TraceStore {
         s
     }
 
-    pub fn put(&mut self, t: Trace) -> u64 {
+    /// Store a trace, durably when backed by a file. Errors surface to the
+    /// caller: a trace_id the server hands out must actually be redeemable
+    /// after a restart, so a failed append is a failed request, not a shrug.
+    pub fn put(&mut self, t: Trace) -> Result<u64, String> {
         let id = self.next;
         self.next += 1;
         if let Some(path) = &self.path {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-                if let Ok(line) = serde_json::to_string(&TraceRecord { id, trace: t.clone() }) {
-                    let _ = writeln!(f, "{line}");
-                    self.lines += 1;
-                }
-            }
+            let line = serde_json::to_string(&TraceRecord { id, trace: t.clone() })
+                .map_err(|e| e.to_string())?;
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("open trace log {path}: {e}"))?;
+            writeln!(f, "{line}").map_err(|e| format!("append trace log: {e}"))?;
+            f.sync_data().map_err(|e| format!("fsync trace log: {e}"))?;
+            self.lines += 1;
         }
         self.map.insert(id, t);
         self.order.push_back(id);
@@ -96,27 +137,53 @@ impl TraceStore {
         }
         // compact if the log has grown well past the live set
         if self.path.is_some() && self.lines > self.cap.saturating_mul(4).max(64) {
-            self.compact();
+            self.compact()?;
         }
-        id
+        Ok(id)
     }
 
-    fn compact(&mut self) {
-        let Some(path) = self.path.clone() else { return };
+    /// Rewrite the log to the live set: temp file + fsync + rename, so a
+    /// crash mid-compaction leaves the old log intact.
+    fn compact(&mut self) -> Result<(), String> {
+        let Some(path) = self.path.clone() else { return Ok(()) };
         let tmp = format!("{path}.tmp");
-        if let Ok(mut f) = std::fs::File::create(&tmp) {
-            let mut n = 0;
+        let mut n = 0;
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             for id in self.order.iter() {
                 if let Some(t) = self.map.get(id) {
-                    if let Ok(line) = serde_json::to_string(&TraceRecord { id: *id, trace: t.clone() }) {
-                        let _ = writeln!(f, "{line}");
-                        n += 1;
-                    }
+                    let line = serde_json::to_string(&TraceRecord { id: *id, trace: t.clone() })
+                        .map_err(|e| e.to_string())?;
+                    writeln!(f, "{line}").map_err(|e| e.to_string())?;
+                    n += 1;
                 }
             }
-            let _ = std::fs::rename(&tmp, &path);
-            self.lines = n;
+            f.sync_all().map_err(|e| e.to_string())?;
         }
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        if let Some(dir) = std::path::Path::new(&path).parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        self.lines = n;
+        Ok(())
+    }
+
+    /// Drop every stored trace and truncate the durable log. Called after WAL
+    /// compaction: traces hold dense NodeId/EdgeIds, which renumber on the
+    /// next replay. The id counter is NOT reset, so a stale client's old
+    /// trace_id can never silently credit a new, unrelated trace.
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.map.clear();
+        self.order.clear();
+        self.lines = 0;
+        if let Some(path) = &self.path {
+            if std::path::Path::new(path).exists() {
+                std::fs::write(path, b"").map_err(|e| format!("truncate trace log: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn get(&self, id: u64) -> Option<Trace> {

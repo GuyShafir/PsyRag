@@ -106,9 +106,14 @@ class PsyRagMemoryService(BaseMemoryService):
         extractor: Callable[[object], str] = default_extractor,
         seed_selector: Callable[[str], list[str]] = default_seed_selector,
         reconcile: bool = False,
+        db: Optional[str] = None,
+        token: Optional[str] = None,
     ):
+        """`db` selects a named database on a multi-DB server — e.g. one per
+        ADK app or per user for hard isolation of learned memory. `token`
+        authenticates against a server running with --token."""
         super().__init__()
-        self.client = PsyRagClient(base_url)
+        self.client = PsyRagClient(base_url, db=db, token=token)
         self.top_k = top_k
         self.depth = depth
         self.extractor = extractor
