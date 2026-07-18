@@ -12,13 +12,34 @@ use std::time::Duration;
 /// Closed set of route classes (the `/db/{name}` prefix is stripped before
 /// classification, so per-DB request cardinality never leaks into labels).
 pub const ROUTES: &[&str] = &[
-    "retrieve", "ingest", "feedback", "touch", "match", "consolidate", "sleep",
-    "checkpoint", "purge", "quarantine", "stats", "graph", "traces", "trace",
-    "dbs", "db_admin", "health", "ui", "other",
+    "retrieve",
+    "ingest",
+    "feedback",
+    "touch",
+    "match",
+    "consolidate",
+    "sleep",
+    "checkpoint",
+    "purge",
+    "quarantine",
+    "stats",
+    "graph",
+    "traces",
+    "trace",
+    "dbs",
+    "db_admin",
+    "health",
+    "ui",
+    "other",
 ];
 
 pub fn classify(db_route: &str) -> usize {
-    let name = match db_route.trim_start_matches('/').split('/').next().unwrap_or("") {
+    let name = match db_route
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+    {
         "retrieve" => "retrieve",
         "ingest" => "ingest",
         "feedback" => "feedback",
@@ -39,7 +60,10 @@ pub fn classify(db_route: &str) -> usize {
         "ui" => "ui",
         _ => "other",
     };
-    ROUTES.iter().position(|r| *r == name).unwrap_or(ROUTES.len() - 1)
+    ROUTES
+        .iter()
+        .position(|r| *r == name)
+        .unwrap_or(ROUTES.len() - 1)
 }
 
 const STATUS_CLASSES: &[&str] = &["2xx", "4xx", "5xx"];
@@ -52,7 +76,9 @@ fn status_class(code: u16) -> usize {
 }
 
 /// Histogram bucket upper bounds, seconds.
-const BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+const BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
 
 struct Hist {
     buckets: Vec<AtomicU64>, // one per bound + one +Inf
@@ -70,9 +96,13 @@ impl Hist {
     }
     fn observe(&self, d: Duration) {
         let s = d.as_secs_f64();
-        let idx = BUCKETS.iter().position(|&b| s <= b).unwrap_or(BUCKETS.len());
+        let idx = BUCKETS
+            .iter()
+            .position(|&b| s <= b)
+            .unwrap_or(BUCKETS.len());
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.sum_micros.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+        self.sum_micros
+            .fetch_add(d.as_micros() as u64, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -99,7 +129,9 @@ impl RequestMetrics {
     /// Render the request-side metrics in Prometheus exposition format.
     pub fn render(&self, out: &mut String) {
         out.push_str("# TYPE psyrag_requests_total counter\n");
-        out.push_str("# HELP psyrag_requests_total HTTP requests by route class and status class.\n");
+        out.push_str(
+            "# HELP psyrag_requests_total HTTP requests by route class and status class.\n",
+        );
         for (r, name) in ROUTES.iter().enumerate() {
             for (sc, scname) in STATUS_CLASSES.iter().enumerate() {
                 let v = self.counters[r][sc].load(Ordering::Relaxed);

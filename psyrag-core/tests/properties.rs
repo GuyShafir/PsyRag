@@ -29,7 +29,13 @@ fn random_graph(rng: &mut Rng, n: usize) -> TemporalGraph {
     for i in 0..n {
         let fan = 1 + rng.below(5);
         let edges: Vec<String> = (0..fan)
-            .map(|_| format!(r#"{{"dst":"n{}","kind":"K{}"}}"#, rng.below(n * 2), rng.below(3)))
+            .map(|_| {
+                format!(
+                    r#"{{"dst":"n{}","kind":"K{}"}}"#,
+                    rng.below(n * 2),
+                    rng.below(3)
+                )
+            })
             .collect();
         ents.push(format!(
             r#"{{"name":"n{i}","type":"t","edges":[{}]}}"#,
@@ -99,7 +105,10 @@ fn homeostat_scale_stays_bounded_under_adversarial_mass() {
             _ => rng.f32_01() * 10.0,
         };
         let s = p.observe(mass);
-        assert!(s.is_finite() && s >= lo && s <= hi, "scale {s} escaped [{lo},{hi}] at step {i}");
+        assert!(
+            s.is_finite() && s >= lo && s <= hi,
+            "scale {s} escaped [{lo},{hi}] at step {i}"
+        );
     }
 }
 

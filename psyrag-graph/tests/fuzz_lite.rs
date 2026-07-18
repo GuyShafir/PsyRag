@@ -120,7 +120,15 @@ fn randomized_op_roundtrip_through_framing() {
     // Ops with hostile-ish strings must survive journal → replay unchanged.
     let path = tmp("roundtrip");
     let mut rng = Rng(0x0BAD_F00D_0BAD_F00D);
-    let weird = ["a\"b", "line\nbreak", "uni\u{00e9}\u{4e2d}", "  spaces  ", "\\backslash\\", "#hash:v1 id=x", "12345678:fakeframe"];
+    let weird = [
+        "a\"b",
+        "line\nbreak",
+        "uni\u{00e9}\u{4e2d}",
+        "  spaces  ",
+        "\\backslash\\",
+        "#hash:v1 id=x",
+        "12345678:fakeframe",
+    ];
     let _ = fs::remove_file(&path);
     let mut expected: Vec<(String, String)> = Vec::new();
     {
@@ -144,8 +152,14 @@ fn randomized_op_roundtrip_through_framing() {
     assert_eq!(pg.replay_skipped, 0);
     let g = pg.graph();
     for (name, origin) in &expected {
-        let id = g.id_of(name).unwrap_or_else(|| panic!("lost node {name:?}"));
-        assert_eq!(g.node_origin_at(id, i64::MAX - 1), origin.as_str(), "origin for {name:?}");
+        let id = g
+            .id_of(name)
+            .unwrap_or_else(|| panic!("lost node {name:?}"));
+        assert_eq!(
+            g.node_origin_at(id, i64::MAX - 1),
+            origin.as_str(),
+            "origin for {name:?}"
+        );
     }
     let _ = fs::remove_file(&path);
 }

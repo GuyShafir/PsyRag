@@ -26,7 +26,11 @@ fn approx_bytes_tracks_growth() {
         false,
     )
     .unwrap();
-    assert_eq!(g.approx_bytes(), b1, "idempotent re-observation adds nothing");
+    assert_eq!(
+        g.approx_bytes(),
+        b1,
+        "idempotent re-observation adds nothing"
+    );
 }
 
 #[test]
@@ -47,7 +51,10 @@ fn approx_bytes_shrinks_after_purge() {
     let before = pg.graph().approx_bytes();
     pg.purge("user:x").unwrap();
     let after = pg.graph().approx_bytes();
-    assert!(after < before, "purge rebuild shrinks the estimate: {before} -> {after}");
+    assert!(
+        after < before,
+        "purge rebuild shrinks the estimate: {before} -> {after}"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -64,10 +71,15 @@ fn token_index_matches_by_token_prefix_deterministically() {
     )
     .unwrap();
     let names = |ids: Vec<u32>| -> Vec<String> {
-        ids.into_iter().map(|i| g.node_name(i).to_string()).collect()
+        ids.into_iter()
+            .map(|i| g.node_name(i).to_string())
+            .collect()
     };
     // exact token
-    assert_eq!(names(g.match_tokens(&["billing".into()], 10)), ["svc/billing"]);
+    assert_eq!(
+        names(g.match_tokens(&["billing".into()], 10)),
+        ["svc/billing"]
+    );
     // token prefix spans multiple nodes, ascending NodeId order
     assert_eq!(
         names(g.match_tokens(&["met".into()], 10)),

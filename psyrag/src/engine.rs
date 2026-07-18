@@ -2,8 +2,8 @@
 //! DURABLE trace store for deferred feedback (credit that arrives after the
 //! retrieval, applied against the trace as it was at retrieval time).
 
-use psyrag_graph::PersistentGraph;
 use psyrag_core::{PlasticityLayer, Trace};
+use psyrag_graph::PersistentGraph;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
@@ -90,7 +90,14 @@ pub struct IdemStore {
 
 impl IdemStore {
     pub fn in_memory(cap: usize, window_ms: i64) -> Self {
-        IdemStore { cap, window_ms, map: HashMap::new(), order: VecDeque::new(), path: None, lines: 0 }
+        IdemStore {
+            cap,
+            window_ms,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            path: None,
+            lines: 0,
+        }
     }
 
     /// Durable store backed by an NDJSON file; replays records still inside
@@ -98,8 +105,12 @@ impl IdemStore {
     /// only weakens dedup for that one key, it never corrupts data).
     pub fn open(cap: usize, window_ms: i64, path: &str) -> Self {
         let mut s = IdemStore {
-            cap, window_ms, map: HashMap::new(), order: VecDeque::new(),
-            path: Some(path.to_string()), lines: 0,
+            cap,
+            window_ms,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            path: Some(path.to_string()),
+            lines: 0,
         };
         let now = now_ms();
         if let Ok(f) = std::fs::File::open(path) {
@@ -142,7 +153,12 @@ impl IdemStore {
     pub fn put(&mut self, key: &str, code: u16, body: &str) -> Result<(), String> {
         let at_ms = now_ms();
         if let Some(path) = &self.path {
-            let rec = IdemRecord { key: key.to_string(), code, body: body.to_string(), at_ms };
+            let rec = IdemRecord {
+                key: key.to_string(),
+                code,
+                body: body.to_string(),
+                at_ms,
+            };
             let line = serde_json::to_string(&rec).map_err(|e| e.to_string())?;
             let mut f = OpenOptions::new()
                 .create(true)
@@ -156,7 +172,8 @@ impl IdemStore {
         if !self.map.contains_key(key) {
             self.order.push_back(key.to_string());
         }
-        self.map.insert(key.to_string(), (code, body.to_string(), at_ms));
+        self.map
+            .insert(key.to_string(), (code, body.to_string(), at_ms));
         while self.order.len() > self.cap {
             if let Some(old) = self.order.pop_front() {
                 self.map.remove(&old);
@@ -169,16 +186,27 @@ impl IdemStore {
     }
 
     fn compact(&mut self) -> Result<(), String> {
-        let Some(path) = self.path.clone() else { return Ok(()) };
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
         let tmp = format!("{path}.tmp");
         let mut n = 0;
         {
             let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             for key in self.order.iter() {
                 if let Some((code, body, at_ms)) = self.map.get(key) {
-                    let rec = IdemRecord { key: key.clone(), code: *code, body: body.clone(), at_ms: *at_ms };
-                    writeln!(f, "{}", serde_json::to_string(&rec).map_err(|e| e.to_string())?)
-                        .map_err(|e| e.to_string())?;
+                    let rec = IdemRecord {
+                        key: key.clone(),
+                        code: *code,
+                        body: body.clone(),
+                        at_ms: *at_ms,
+                    };
+                    writeln!(
+                        f,
+                        "{}",
+                        serde_json::to_string(&rec).map_err(|e| e.to_string())?
+                    )
+                    .map_err(|e| e.to_string())?;
                     n += 1;
                 }
             }
@@ -210,14 +238,25 @@ pub struct TraceStore {
 
 impl TraceStore {
     pub fn in_memory(cap: usize) -> Self {
-        TraceStore { cap, next: 1, map: HashMap::new(), order: VecDeque::new(), path: None, lines: 0 }
+        TraceStore {
+            cap,
+            next: 1,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            path: None,
+            lines: 0,
+        }
     }
 
     /// Durable store backed by an NDJSON file; replays existing records.
     pub fn open(cap: usize, path: &str) -> Self {
         let mut s = TraceStore {
-            cap, next: 1, map: HashMap::new(), order: VecDeque::new(),
-            path: Some(path.to_string()), lines: 0,
+            cap,
+            next: 1,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            path: Some(path.to_string()),
+            lines: 0,
         };
         if let Ok(f) = std::fs::File::open(path) {
             for line in BufReader::new(f).lines().map_while(Result::ok) {
@@ -250,8 +289,11 @@ impl TraceStore {
         let id = self.next;
         self.next += 1;
         if let Some(path) = &self.path {
-            let line = serde_json::to_string(&TraceRecord { id, trace: t.clone() })
-                .map_err(|e| e.to_string())?;
+            let line = serde_json::to_string(&TraceRecord {
+                id,
+                trace: t.clone(),
+            })
+            .map_err(|e| e.to_string())?;
             let mut f = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -278,15 +320,20 @@ impl TraceStore {
     /// Rewrite the log to the live set: temp file + fsync + rename, so a
     /// crash mid-compaction leaves the old log intact.
     fn compact(&mut self) -> Result<(), String> {
-        let Some(path) = self.path.clone() else { return Ok(()) };
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
         let tmp = format!("{path}.tmp");
         let mut n = 0;
         {
             let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             for id in self.order.iter() {
                 if let Some(t) = self.map.get(id) {
-                    let line = serde_json::to_string(&TraceRecord { id: *id, trace: t.clone() })
-                        .map_err(|e| e.to_string())?;
+                    let line = serde_json::to_string(&TraceRecord {
+                        id: *id,
+                        trace: t.clone(),
+                    })
+                    .map_err(|e| e.to_string())?;
                     writeln!(f, "{line}").map_err(|e| e.to_string())?;
                     n += 1;
                 }
@@ -294,7 +341,10 @@ impl TraceStore {
             f.sync_all().map_err(|e| e.to_string())?;
         }
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-        if let Some(dir) = std::path::Path::new(&path).parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(dir) = std::path::Path::new(&path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
             if let Ok(d) = std::fs::File::open(dir) {
                 let _ = d.sync_all();
             }

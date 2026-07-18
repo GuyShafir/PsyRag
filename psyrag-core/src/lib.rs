@@ -242,7 +242,7 @@ pub struct Fired {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trace {
     fired: Vec<Fired>,
-    incoming: Vec<f32>, // total edge-derived activation into each node
+    incoming: Vec<f32>,           // total edge-derived activation into each node
     surfaced: Vec<(NodeId, f32)>, // returned top-k: (node id, final activation)
     t: Ts,
 }
@@ -261,7 +261,10 @@ impl Trace {
     /// Fired edges as (edge_id, src_node, dst_node, delivered_activation), hop
     /// order. For trace visualization / management UIs.
     pub fn fired(&self) -> Vec<(EdgeId, NodeId, NodeId, f32)> {
-        self.fired.iter().map(|f| (f.eid, f.u, f.v, f.delta)).collect()
+        self.fired
+            .iter()
+            .map(|f| (f.eid, f.u, f.v, f.delta))
+            .collect()
     }
 }
 
@@ -628,7 +631,12 @@ impl PlasticityLayer {
                         act[v] += delta;
                         incoming[v] += delta;
                         mass += delta;
-                        fired.push(Fired { eid, u, v: e.dst, delta });
+                        fired.push(Fired {
+                            eid,
+                            u,
+                            v: e.dst,
+                            delta,
+                        });
                     }
                 }
             }
@@ -793,24 +801,22 @@ impl PlasticityLayer {
                     }
                 }
             }
-            Credit::Episodic { reward, spread } => {
-                match spread {
-                    Spread::Uniform => {
-                        let n = trace.surfaced.len().max(1) as f32;
-                        for &(id, _) in &trace.surfaced {
-                            cred[id as usize] += reward / n;
-                        }
+            Credit::Episodic { reward, spread } => match spread {
+                Spread::Uniform => {
+                    let n = trace.surfaced.len().max(1) as f32;
+                    for &(id, _) in &trace.surfaced {
+                        cred[id as usize] += reward / n;
                     }
-                    Spread::ByActivation => {
-                        let total: f32 = trace.surfaced.iter().map(|(_, a)| *a).sum();
-                        if total > 0.0 {
-                            for &(id, a) in &trace.surfaced {
-                                cred[id as usize] += reward * (a / total);
-                            }
+                }
+                Spread::ByActivation => {
+                    let total: f32 = trace.surfaced.iter().map(|(_, a)| *a).sum();
+                    if total > 0.0 {
+                        for &(id, a) in &trace.surfaced {
+                            cred[id as usize] += reward * (a / total);
                         }
                     }
                 }
-            }
+            },
         }
         // optional anti-Hebbian depression of surfaced-but-uncredited nodes
         if self.cfg.feedback_miss_penalty > 0.0 {
@@ -826,6 +832,7 @@ impl PlasticityLayer {
 
     /// Name-based explicit feedback (stateless): retrieve (traced), credit the
     /// `used` nodes with `feedback_hit`, apply. Deterministic given `t_now`.
+    #[allow(clippy::too_many_arguments)]
     pub fn feedback(
         &mut self,
         g: &TemporalGraph,
@@ -845,6 +852,7 @@ impl PlasticityLayer {
     /// Episodic feedback (stateless): one scalar `reward` for the whole
     /// retrieval, spread over surfaced nodes. This is the RL/outcome path — wire
     /// it to "the task the retrieval fed actually succeeded".
+    #[allow(clippy::too_many_arguments)]
     pub fn feedback_reward(
         &mut self,
         g: &TemporalGraph,
@@ -867,6 +875,7 @@ impl PlasticityLayer {
     ///   3. L1-renormalize each source's live out-edges to norm_target,
     ///   4. detect same-(src,kind) open-edge contradictions in the GRAPH and
     ///      return the losers as RetireEdge ops for the caller to journal.
+    ///
     /// Returns (stats, conflicts). The graph is read-only here.
     pub fn consolidate(
         &mut self,
@@ -929,7 +938,8 @@ impl PlasticityLayer {
             let mut by_kind: HashMap<u32, Vec<EdgeId>> = HashMap::new();
             for &eid in g.out_edge_ids(u as NodeId) {
                 let e = g.edge(eid);
-                if e.valid_to == T_MAX && self.cfg.functional_kinds.contains(g.kind_str(e.kind_id)) {
+                if e.valid_to == T_MAX && self.cfg.functional_kinds.contains(g.kind_str(e.kind_id))
+                {
                     by_kind.entry(e.kind_id).or_default().push(eid);
                 }
             }
@@ -993,6 +1003,7 @@ impl PlasticityLayer {
     ///      the protection threshold (anti-catastrophic-forgetting: durable
     ///      memories survive even when unused today),
     ///   5. per-source L1 **renormalize** (competition).
+    ///
     /// In a tiered deployment this is also where the working graph's learned
     /// deltas are flushed to long-term store (the GCP backend) — see DESIGN.
     pub fn sleep(&mut self, g: &TemporalGraph, t_now: Ts) -> SleepReport {
@@ -1016,7 +1027,11 @@ impl PlasticityLayer {
         sorted.sort_by(f32::total_cmp);
         let frac = self.cfg.protect_top_frac.clamp(0.0, 1.0);
         let q = ((1.0 - frac) * (sorted.len().saturating_sub(1)) as f32).round() as usize;
-        let protect_thr = if sorted.is_empty() { f32::MAX } else { sorted[q.min(sorted.len() - 1)] };
+        let protect_thr = if sorted.is_empty() {
+            f32::MAX
+        } else {
+            sorted[q.min(sorted.len() - 1)]
+        };
         // 3 + 4. downscale then prune (protecting the consolidated top)
         let ds = self.cfg.sleep_downscale;
         let (mut downscaled, mut pruned, mut protected) = (0usize, 0usize, 0usize);
@@ -1171,9 +1186,7 @@ impl PlasticityLayer {
         // A sidecar bound to a DIFFERENT WAL lineage is a copy/restore
         // mistake: refuse loudly rather than let stable keys silently
         // cross-pollinate two databases that happen to share edge names.
-        if let (Some(ours), Some((theirs, _))) =
-            (&p.wal_id, self.wal_binding.as_ref())
-        {
+        if let (Some(ours), Some((theirs, _))) = (&p.wal_id, self.wal_binding.as_ref()) {
             if ours != theirs {
                 return Err(format!(
                     "sidecar {path} belongs to WAL {ours}, not this WAL {theirs} —                      wrong file? (delete it to start learning fresh)"
@@ -1247,8 +1260,7 @@ impl PlasticityLayer {
     /// Entries whose edge no longer exists are dropped (that is the point,
     /// after a purge); new edges seed fresh.
     pub fn restore_keys(&mut self, g: &TemporalGraph, snap: &[(u64, f32, Ts, f32, bool)]) {
-        let by_key: HashMap<u64, usize> =
-            snap.iter().enumerate().map(|(i, e)| (e.0, i)).collect();
+        let by_key: HashMap<u64, usize> = snap.iter().enumerate().map(|(i, e)| (e.0, i)).collect();
         self.w.clear();
         self.t_last.clear();
         self.neg_lambda.clear();
@@ -1414,7 +1426,7 @@ mod tests {
         let r = p.retrieve(&g, &["hub"], 2, 0.9, 10, 1 * S);
         assert!(r.mass > 0.0);
         assert_eq!(r.top[0].node, "hub"); // seed strongest
-        // f is reachable at depth 2 via a
+                                          // f is reachable at depth 2 via a
         assert!(r.top.iter().any(|na| na.node == "f"));
     }
 
@@ -1453,7 +1465,10 @@ mod tests {
         assert!(w_ha1 > w_ha0, "hub->a reinforced via path credit");
         let d_af = w_af1 - w_af0;
         let d_ha = w_ha1 - w_ha0;
-        assert!(d_af > d_ha, "closer-to-used edge gets more credit: {d_af} vs {d_ha}");
+        assert!(
+            d_af > d_ha,
+            "closer-to-used edge gets more credit: {d_af} vs {d_ha}"
+        );
     }
 
     #[test]
@@ -1468,7 +1483,10 @@ mod tests {
         let w_b0 = p.effective_weight(hub_b, 1 * S);
         p.feedback(&g, &["hub"], 2, 0.9, 10, 1 * S, &["a"]);
         let w_b1 = p.effective_weight(hub_b, 1 * S);
-        assert!((w_b1 - w_b0).abs() < 1e-6, "unused sibling untouched: {w_b0}->{w_b1}");
+        assert!(
+            (w_b1 - w_b0).abs() < 1e-6,
+            "unused sibling untouched: {w_b0}->{w_b1}"
+        );
     }
 
     #[test]
@@ -1526,7 +1544,10 @@ mod tests {
         let b1 = p.effective_weight(hb, 1 * S);
         assert!(rep.edges_reinforced > 0 && rep.total_positive_r > 0.0);
         assert!(a1 > a0 && b1 > b0, "episodic lifts all surfaced children");
-        assert!((( a1 - a0) - (b1 - b0)).abs() < 1e-6, "symmetric children gain equally");
+        assert!(
+            ((a1 - a0) - (b1 - b0)).abs() < 1e-6,
+            "symmetric children gain equally"
+        );
     }
 
     #[test]
@@ -1541,7 +1562,12 @@ mod tests {
         let hb = p.edge_id(&g, "hub", "b", "CALLS").unwrap();
         let (a0, b0) = (p.effective_weight(ha, 1 * S), p.effective_weight(hb, 1 * S));
         let (_r, trace) = p.retrieve_traced(&g, &["hub"], 1, 0.9, 10, 1 * S);
-        p.apply_credit(&g, &trace, &Credit::Nodes(vec![("a".into(), 1.0), ("b".into(), -1.0)]), 1 * S);
+        p.apply_credit(
+            &g,
+            &trace,
+            &Credit::Nodes(vec![("a".into(), 1.0), ("b".into(), -1.0)]),
+            1 * S,
+        );
         let (a1, b1) = (p.effective_weight(ha, 1 * S), p.effective_weight(hb, 1 * S));
         assert!(a1 > a0, "preferred up");
         assert!(b1 < b0, "dispreferred down");
@@ -1566,8 +1592,14 @@ mod tests {
         // downscaling lowered the mean weight
         assert!(rep.mean_weight_after < rep.mean_weight_before || rep.pruned > 0);
         // the strong edge survived (protected); the weak one was pruned
-        assert!(p.effective_weight(ha, 100 * S) > 0.0, "consolidated edge survives");
-        assert!(p.effective_weight(he, 100 * S) == 0.0, "weak edge pruned in sleep");
+        assert!(
+            p.effective_weight(ha, 100 * S) > 0.0,
+            "consolidated edge survives"
+        );
+        assert!(
+            p.effective_weight(he, 100 * S) == 0.0,
+            "weak edge pruned in sleep"
+        );
         assert!(rep.protected >= 1 && rep.pruned >= 1);
     }
 
@@ -1587,7 +1619,10 @@ mod tests {
         let mut p = PlasticityLayer::new(cfg);
         p.sync(&g);
         let bad = p.edge_id(&g, "hub", "tainted", "BAD").unwrap();
-        assert!(p.effective_weight(bad, 1 * S) > 0.0, "visible before quarantine");
+        assert!(
+            p.effective_weight(bad, 1 * S) > 0.0,
+            "visible before quarantine"
+        );
         let r0 = p.retrieve(&g, &["hub"], 1, 0.9, 10, 1 * S);
         assert!(r0.top.iter().any(|n| n.node == "tainted"));
 
@@ -1604,7 +1639,10 @@ mod tests {
 
         // Restore: the stored weight was never modified.
         p.set_trust(&g, "evil:", 1.0);
-        assert!(p.effective_weight(bad, 1 * S) > 0.0, "restored, not destroyed");
+        assert!(
+            p.effective_weight(bad, 1 * S) > 0.0,
+            "restored, not destroyed"
+        );
     }
 
     #[test]

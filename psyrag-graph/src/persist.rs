@@ -85,7 +85,11 @@ pub fn crc32(data: &[u8]) -> u32 {
             let mut c = i;
             let mut k = 0;
             while k < 8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
                 k += 1;
             }
             t[i as usize] = c;
@@ -152,7 +156,9 @@ fn parse_line(s: &str) -> Result<Parsed, String> {
         let json = &s[9..];
         let got = crc32(json.as_bytes());
         if got != want {
-            return Err(format!("crc mismatch (recorded {want:08x}, computed {got:08x})"));
+            return Err(format!(
+                "crc mismatch (recorded {want:08x}, computed {got:08x})"
+            ));
         }
         let op = serde_json::from_str(json)
             .map_err(|e| format!("valid crc but unparseable op (schema change?): {e}"))?;
@@ -455,7 +461,10 @@ impl PersistentGraph {
     /// pre-existing archives and backups, which still contain it.
     pub fn purge(&mut self, origin_prefix: &str) -> Result<PurgeReport, String> {
         if origin_prefix.is_empty() {
-            return Err("refusing to purge with an empty origin prefix (would drop everything unlabeled)".into());
+            return Err(
+                "refusing to purge with an empty origin prefix (would drop everything unlabeled)"
+                    .into(),
+            );
         }
         let (ops, nodes_dropped, edges_dropped) = self.open_state_ops(Some(origin_prefix));
         let (bytes_before, bytes_after, _) = self.rewrite_wal(&ops, false)?;
@@ -494,7 +503,11 @@ impl PersistentGraph {
         let mut nodes_dropped = 0usize;
         for id in 0..g.node_count() {
             let n = g.node(id as crate::graph::NodeId);
-            let Some(v) = n.versions.last().filter(|v| v.retired_at == crate::graph::T_MAX) else {
+            let Some(v) = n
+                .versions
+                .last()
+                .filter(|v| v.retired_at == crate::graph::T_MAX)
+            else {
                 continue; // fully retired: drop from the working log
             };
             if matches(v.origin_id) {
@@ -503,8 +516,7 @@ impl PersistentGraph {
                 continue;
             }
             let type_str = g.types.resolve(n.type_id).to_string();
-            let origin = (v.origin_id != 0)
-                .then(|| g.origins.resolve(v.origin_id).to_string());
+            let origin = (v.origin_id != 0).then(|| g.origins.resolve(v.origin_id).to_string());
             if n.placeholder {
                 ops.push(Op::ObservePlaceholder {
                     name: n.name.clone(),
@@ -540,8 +552,7 @@ impl PersistentGraph {
                 dst: g.node_name(e.dst).to_string(),
                 kind: g.kind_str(e.kind_id).to_string(),
                 ts: e.valid_from,
-                origin: (e.origin_id != 0)
-                    .then(|| g.origins.resolve(e.origin_id).to_string()),
+                origin: (e.origin_id != 0).then(|| g.origins.resolve(e.origin_id).to_string()),
             });
         }
         (ops, nodes_dropped, edges_dropped)
@@ -686,8 +697,7 @@ impl PersistentGraph {
         use crate::gcp::{asset_ops, parse_snapshot};
         use crate::snapshot::ingest_snapshot_ops;
         let assets = parse_snapshot(json)?;
-        let stale =
-            ingest_snapshot_ops(self, assets.iter().map(|a| asset_ops(a, ts)), ts, true)?;
+        let stale = ingest_snapshot_ops(self, assets.iter().map(|a| asset_ops(a, ts)), ts, true)?;
         self.flush()?;
         Ok(stale)
     }

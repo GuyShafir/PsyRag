@@ -86,8 +86,10 @@ fn generic_entities_persist_through_wal() {
     let _ = std::fs::remove_file(&path);
     {
         let mut pg = PersistentGraph::open(&path).unwrap();
-        pg.ingest_entities(&snapshot("automation/kitchen-lights"), T1, true).unwrap();
-        pg.ingest_entities(&snapshot("automation/alarm"), T2, true).unwrap();
+        pg.ingest_entities(&snapshot("automation/kitchen-lights"), T1, true)
+            .unwrap();
+        pg.ingest_entities(&snapshot("automation/alarm"), T2, true)
+            .unwrap();
     }
     let pg = PersistentGraph::open(&path).unwrap();
     assert_eq!(pg.replay_skipped, 0);

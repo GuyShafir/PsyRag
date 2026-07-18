@@ -21,7 +21,11 @@ pub fn set_format(f: Format) {
     FORMAT.store(if f == Format::Json { 0 } else { 1 }, Ordering::Relaxed);
 }
 fn format() -> Format {
-    if FORMAT.load(Ordering::Relaxed) == 0 { Format::Json } else { Format::Text }
+    if FORMAT.load(Ordering::Relaxed) == 0 {
+        Format::Json
+    } else {
+        Format::Text
+    }
 }
 
 /// Unix millis -> RFC3339 UTC ("2026-07-18T09:00:00.123Z"). Civil-date

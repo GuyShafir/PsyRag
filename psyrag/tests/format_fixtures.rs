@@ -92,7 +92,10 @@ fn sidecar_v2_keyed_loads_against_v1_graph() {
         layer.effective_weight(xy, t) > layer.effective_weight(yz, t),
         "learned reinforcement present in the fixture"
     );
-    assert!(layer.loaded_binding.is_some(), "v2 fixture carries WAL binding");
+    assert!(
+        layer.loaded_binding.is_some(),
+        "v2 fixture carries WAL binding"
+    );
 }
 
 #[test]
@@ -124,6 +127,9 @@ fn replay_is_time_independent() {
     let a = run();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let b = run();
-    assert_eq!(a, b, "replay + fixed-ts retrieval is wall-clock independent");
+    assert_eq!(
+        a, b,
+        "replay + fixed-ts retrieval is wall-clock independent"
+    );
     let _ = fs::remove_file(&p);
 }

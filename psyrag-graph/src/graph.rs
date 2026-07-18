@@ -452,7 +452,9 @@ impl TemporalGraph {
 
     /// Close the node's open version and all its open edges at `ts`.
     pub fn retire_node(&mut self, name: &str, ts: Ts) {
-        let Some(&id) = self.name_to_id.get(name) else { return };
+        let Some(&id) = self.name_to_id.get(name) else {
+            return;
+        };
         if let Some(open) = self.nodes[id as usize].open_version_mut() {
             open.retired_at = ts;
         }
@@ -549,7 +551,9 @@ impl TemporalGraph {
     /// snapshot ingestion to retire edges a re-observed source stopped
     /// asserting (reference retargeting with both endpoints still alive).
     pub fn open_out_edges_named(&self, src: &str) -> Vec<(String, String)> {
-        let Some(id) = self.id_of(src) else { return Vec::new() };
+        let Some(id) = self.id_of(src) else {
+            return Vec::new();
+        };
         self.out_adj[id as usize]
             .iter()
             .filter_map(|&eid| {
@@ -569,14 +573,31 @@ impl TemporalGraph {
     /// (NodeIds are process-local).
     pub fn apply(&mut self, op: &Op) {
         match op {
-            Op::ObserveNode { name, asset_type, props, ts, origin } => {
+            Op::ObserveNode {
+                name,
+                asset_type,
+                props,
+                ts,
+                origin,
+            } => {
                 self.observe_node_from(name, asset_type, props.clone(), *ts, origin.as_deref());
             }
-            Op::ObservePlaceholder { name, inferred_type, ts, origin } => {
+            Op::ObservePlaceholder {
+                name,
+                inferred_type,
+                ts,
+                origin,
+            } => {
                 self.observe_placeholder_from(name, inferred_type, *ts, origin.as_deref());
             }
             Op::RetireNode { name, ts } => self.retire_node(name, *ts),
-            Op::ObserveEdge { src, dst, kind, ts, origin } => {
+            Op::ObserveEdge {
+                src,
+                dst,
+                kind,
+                ts,
+                origin,
+            } => {
                 // Edges may arrive before either endpoint's real record;
                 // materialize endpoints as untyped placeholders if needed.
                 let s = self.placeholder_if_absent(src, *ts);
@@ -675,14 +696,10 @@ impl TemporalGraph {
 
     /// Cycle-safe BFS over edges alive at `t`. Returns reachable nodes with
     /// the traversal path that got there — the explainability payload.
-    pub fn blast_radius(
-        &self,
-        origin: &str,
-        t: Ts,
-        dir: Direction,
-        max_depth: u32,
-    ) -> Vec<Reach> {
-        let Some(start) = self.id_of(origin) else { return Vec::new() };
+    pub fn blast_radius(&self, origin: &str, t: Ts, dir: Direction, max_depth: u32) -> Vec<Reach> {
+        let Some(start) = self.id_of(origin) else {
+            return Vec::new();
+        };
         if !self.nodes[start as usize].alive_at(t) {
             return Vec::new();
         }
@@ -695,9 +712,12 @@ impl TemporalGraph {
             if depth >= max_depth {
                 continue;
             }
-            let step = |nb: NodeId, kind_id: u32, arrow: &str, out: &mut Vec<Reach>,
-                            q: &mut VecDeque<(NodeId, u32, String)>,
-                            visited: &mut HashSet<NodeId>| {
+            let step = |nb: NodeId,
+                        kind_id: u32,
+                        arrow: &str,
+                        out: &mut Vec<Reach>,
+                        q: &mut VecDeque<(NodeId, u32, String)>,
+                        visited: &mut HashSet<NodeId>| {
                 if visited.contains(&nb) {
                     return;
                 }
@@ -706,11 +726,14 @@ impl TemporalGraph {
                     return;
                 }
                 visited.insert(nb);
-                let p = format!("{} {}[{}]{} {}", path,
+                let p = format!(
+                    "{} {}[{}]{} {}",
+                    path,
                     if arrow == ">" { "-" } else { "<" },
                     self.kinds.resolve(kind_id),
                     if arrow == ">" { "->" } else { "-" },
-                    n.name);
+                    n.name
+                );
                 out.push(Reach {
                     node: n.name.clone(),
                     node_type: self.types.resolve(n.type_id).to_string(),
@@ -772,7 +795,12 @@ mod bench {
         for p in 0..n_projects {
             for i in (0..per_project).step_by(100) {
                 let name = format!("//run/p{p}/services/s{i}");
-                g.observe_node(&name, "run/Service", serde_json::json!({"image": "img:vNEW"}), t2);
+                g.observe_node(
+                    &name,
+                    "run/Service",
+                    serde_json::json!({"image": "img:vNEW"}),
+                    t2,
+                );
             }
         }
         let t = Instant::now();
@@ -787,7 +815,9 @@ mod bench {
 
         eprintln!(
             "nodes={} edges={} | full diff: {diff_ms}ms | blast radius ({} hits): {br_us}us",
-            g.node_count(), g.edge_count(), hit.len()
+            g.node_count(),
+            g.edge_count(),
+            hit.len()
         );
     }
 }

@@ -50,9 +50,13 @@ fn wal_roundtrip_preserves_history() {
     // Session 1: two snapshots with drift (image bump, subnet swap).
     {
         let mut pg = PersistentGraph::open(&path).unwrap();
-        let z1 = pg.ingest_cai_snapshot(&mini_snapshot("img:v1", "subnet-a"), T1).unwrap();
+        let z1 = pg
+            .ingest_cai_snapshot(&mini_snapshot("img:v1", "subnet-a"), T1)
+            .unwrap();
         assert!(z1.is_empty());
-        let z2 = pg.ingest_cai_snapshot(&mini_snapshot("img:v2", "subnet-b"), T2).unwrap();
+        let z2 = pg
+            .ingest_cai_snapshot(&mini_snapshot("img:v2", "subnet-b"), T2)
+            .unwrap();
         assert_eq!(z2.len(), 1); // subnet-a pruned
     } // dropped: WAL is the only surviving state
 
@@ -95,7 +99,8 @@ fn torn_tail_is_tolerated() {
     }
     // Simulate a crash mid-append.
     let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-    f.write_all(b"{\"op\":\"observe_node\",\"name\":\"b\",\"asset_t").unwrap();
+    f.write_all(b"{\"op\":\"observe_node\",\"name\":\"b\",\"asset_t")
+        .unwrap();
     drop(f);
 
     {
@@ -173,8 +178,10 @@ fn compaction_preserves_open_state_and_drops_history() {
     let (report, live_nodes_before, live_edges_before) = {
         let mut pg = PersistentGraph::open(&path).unwrap();
         // Two snapshots with churn: subnet-a exists at T1, replaced at T2.
-        pg.ingest_cai_snapshot(&mini_snapshot("img:v1", "subnet-a"), T1).unwrap();
-        pg.ingest_cai_snapshot(&mini_snapshot("img:v2", "subnet-b"), T2).unwrap();
+        pg.ingest_cai_snapshot(&mini_snapshot("img:v1", "subnet-a"), T1)
+            .unwrap();
+        pg.ingest_cai_snapshot(&mini_snapshot("img:v2", "subnet-b"), T2)
+            .unwrap();
         let g = pg.graph();
         let live_nodes = g.alive_at(T2 + 1).len();
         let live_edges = (0..g.edge_count())
@@ -193,7 +200,10 @@ fn compaction_preserves_open_state_and_drops_history() {
         pg.flush().unwrap();
         (report, live_nodes, live_edges)
     };
-    assert!(report.bytes_after < report.bytes_before, "log shrank: {report:?}");
+    assert!(
+        report.bytes_after < report.bytes_before,
+        "log shrank: {report:?}"
+    );
     let archive = report.archive.clone().expect("archive kept");
     assert!(std::path::Path::new(&archive).exists());
 
@@ -207,9 +217,16 @@ fn compaction_preserves_open_state_and_drops_history() {
         .count();
     assert_eq!(live_edges_after, live_edges_before);
     // valid_from preserved through compaction (stable-key prerequisite)
-    assert!(g.blast_radius(API, T2 + 1, Direction::Down, 5).iter().any(|r| r.node.contains("subnet-b")));
+    assert!(g
+        .blast_radius(API, T2 + 1, Direction::Down, 5)
+        .iter()
+        .any(|r| r.node.contains("subnet-b")));
     // dropped: subnet-a (retired before compaction) is no longer known at all
-    assert!(g.id_of(&format!("//compute.googleapis.com/projects/p/regions/r/subnetworks/subnet-a")).is_none());
+    assert!(g
+        .id_of(&format!(
+            "//compute.googleapis.com/projects/p/regions/r/subnetworks/subnet-a"
+        ))
+        .is_none());
     // the post-compaction append made it through the adopted fd
     assert!(g.id_of("post-compact").is_some());
 
@@ -227,7 +244,8 @@ fn origin_survives_wal_roundtrip_and_compaction() {
     ]"#;
     {
         let mut pg = PersistentGraph::open(&path).unwrap();
-        pg.ingest_entities_from(entities, T1, false, Some("batch:default")).unwrap();
+        pg.ingest_entities_from(entities, T1, false, Some("batch:default"))
+            .unwrap();
         // per-entity origin wins over batch origin; unlabeled entity gets batch's
         let g = pg.graph();
         let a = g.id_of("a").unwrap();
@@ -274,10 +292,19 @@ fn purge_removes_a_subject_completely() {
         let g = pg.graph();
         assert!(g.id_of("alice-secret").is_none());
         assert!(g.id_of("bob-fact").is_some());
-        assert!(g.id_of("shared").is_some(), "properly-observed shared node survives");
+        assert!(
+            g.id_of("shared").is_some(),
+            "properly-observed shared node survives"
+        );
         // bob's edge to shared survived
         let bob = g.id_of("bob-fact").unwrap();
-        assert_eq!(g.out_edge_ids(bob).iter().filter(|&&e| g.edge(e).alive_at(T1 + 1)).count(), 1);
+        assert_eq!(
+            g.out_edge_ids(bob)
+                .iter()
+                .filter(|&&e| g.edge(e).alive_at(T1 + 1))
+                .count(),
+            1
+        );
     }
     // The purged name is gone from the BYTES of the log, not just the graph.
     let raw = fs::read_to_string(&path).unwrap();

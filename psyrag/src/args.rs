@@ -36,14 +36,21 @@ impl Args {
             }
             i += 1;
         }
-        Args { positionals, flags, bools }
+        Args {
+            positionals,
+            flags,
+            bools,
+        }
     }
 
     pub fn subcommand(&self) -> Option<&str> {
         self.positionals.first().map(|s| s.as_str())
     }
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.flags.get(key).and_then(|v| v.last()).map(|s| s.as_str())
+        self.flags
+            .get(key)
+            .and_then(|v| v.last())
+            .map(|s| s.as_str())
     }
     pub fn get_all(&self, key: &str) -> Vec<String> {
         self.flags.get(key).cloned().unwrap_or_default()

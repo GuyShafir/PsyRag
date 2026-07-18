@@ -144,7 +144,10 @@ fn placeholder_upgraded_by_real_record() {
     let id = g.id_of(VPC).unwrap();
     let node = g.node(id);
     assert!(!node.placeholder);
-    assert_eq!(g.types.resolve(node.type_id), "compute.googleapis.com/Network");
+    assert_eq!(
+        g.types.resolve(node.type_id),
+        "compute.googleapis.com/Network"
+    );
 }
 
 #[test]
@@ -162,7 +165,7 @@ fn diff_answers_what_changed() {
     assert!(d.nodes_removed.contains(&SUBNET_A.to_string()));
     assert!(d.nodes_added.iter().any(|n| n.contains("subnet-b")));
     assert!(d.nodes_changed.contains(&API.to_string())); // image v1 -> v2
-    // rewired reference: api -> subnet-a removed, api -> subnet-b added
+                                                         // rewired reference: api -> subnet-a removed, api -> subnet-b added
     assert!(d.edges_removed.iter().any(|e| e.contains("subnet-a")));
     assert!(d.edges_added.iter().any(|e| e.contains("subnet-b")));
     // idempotence: nothing changed between two points after t2

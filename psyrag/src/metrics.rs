@@ -28,20 +28,23 @@ pub fn fetch(url: &str) -> Result<Metrics, String> {
 }
 
 fn http_get(url: &str) -> Result<String, String> {
-    let rest = url.strip_prefix("http://").ok_or("only http:// supported")?;
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("only http:// supported")?;
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
     let host = hostport.split(':').next().unwrap_or("127.0.0.1");
-    let mut stream = TcpStream::connect(hostport).map_err(|e| format!("connect {hostport}: {e}"))?;
+    let mut stream =
+        TcpStream::connect(hostport).map_err(|e| format!("connect {hostport}: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| e.to_string())?;
-    let req = format!(
-        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut raw = String::new();
     stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
     // split headers/body on the blank line
