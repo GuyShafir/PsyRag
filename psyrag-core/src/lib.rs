@@ -452,6 +452,25 @@ impl PlasticityLayer {
         }
     }
 
+    /// Recompute per-edge decay rates from the CURRENT config's authority
+    /// settings. `neg_lambda` is derived state (`lambda_base/(1+beta*auth)`
+    /// by edge kind); recomputing on load makes `authority_by_kind` /
+    /// `lambda_base` / `beta` changes retroactive to existing edges instead
+    /// of frozen at first observation. O(edges).
+    pub fn resync_authority(&mut self, g: &TemporalGraph) {
+        let n = self.w.len().min(g.edge_count());
+        for eid in 0..n {
+            let e = g.edge(eid as EdgeId);
+            let kind = g.kind_str(e.kind_id);
+            let auth = *self
+                .cfg
+                .authority_by_kind
+                .get(kind)
+                .unwrap_or(&self.cfg.authority_default);
+            self.neg_lambda[eid] = -(self.cfg.lambda_base / (1.0 + self.cfg.beta * auth));
+        }
+    }
+
     /// Recompute the whole trust column from graph provenance + config. Call
     /// after changing `trust_by_origin` (e.g. a quarantine). O(edges).
     pub fn resync_trust(&mut self, g: &TemporalGraph) {
@@ -1198,9 +1217,11 @@ impl PlasticityLayer {
         }
         self.set_lambda_scale(p.lambda_scale);
         self.homeo = p.homeo;
-        // Trust is derived state; rebuild it for whatever columns we now have
-        // (the v1 positional path bypasses sync's incremental growth).
+        // Trust and per-edge decay are derived state; rebuild both from the
+        // CURRENT config so config edits apply retroactively (and the v1
+        // positional path gets its columns at all).
         self.resync_trust(g);
+        self.resync_authority(g);
         Ok(())
     }
 

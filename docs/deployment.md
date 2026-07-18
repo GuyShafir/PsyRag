@@ -155,10 +155,17 @@ operational state with AlloyDB (see [architecture.md](architecture.md)).
 
 Three ways to verify, plus the console for manual exploration.
 
-### Unit tests
+### Unit, golden, property & fuzz-lite tests
 ```bash
-cargo test --release          # 26 tests: psyrag-graph (12) + psyrag-core (13) + monitor (1)
+cargo test --release
 ```
+Beyond unit tests this runs: the **golden learning suite** (fixed corpus,
+exact ranking expectations), the **format fixture zoo** (every historical
+on-disk format replays forever; future formats refuse loudly), **property
+tests** (per-source L1 renorm budget, homeostat bounds under adversarial
+mass, finite activations under random load), and **fuzz-lite** (hundreds of
+seeded byte-mutated WALs and thousands of garbage payloads — errors allowed,
+panics and silent misreplay are not).
 
 ### kill -9 crash-recovery suite
 ```bash

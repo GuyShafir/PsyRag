@@ -329,6 +329,11 @@ Every field is optional; omitted fields take the default shown.
 | `theta` | 0.01 | daytime prune floor |
 | `norm_target` | 1.0 | per-source L1 budget |
 
+**Config retroactivity.** `authority_by_kind`, `lambda_base`, `beta`, and
+`trust_by_origin` are re-resolved against every edge on each load — editing
+the config and restarting (or reloading a DB) applies the new decay/trust
+behavior to existing edges, not just new ones.
+
 ### Authority & conflicts
 | key | default | meaning |
 |-----|---------|---------|
