@@ -59,6 +59,14 @@ pub struct ServeOpts {
     pub sleep_every: Option<Duration>,
     pub consolidate_every: Option<Duration>,
     pub checkpoint_every: Option<Duration>,
+    /// Per-database growth quotas (0 = unlimited). Exceeding either rejects
+    /// further /ingest with 507; maintenance and feedback stay allowed so a
+    /// full database can still be consolidated, checkpointed, or purged.
+    pub max_db_bytes: usize,
+    pub max_db_edges: usize,
+    /// Server-wide memory budget over all open DBs (0 = unlimited). Over
+    /// budget: idle DBs are evicted; if still over, /ingest sheds with 429.
+    pub max_mem_bytes: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -284,6 +292,46 @@ impl Registry {
             return Ok(Scope::Read);
         }
         Err(err("invalid token", 401))
+    }
+
+    /// Estimated bytes for one engine: graph structures + sidecar columns.
+    fn engine_bytes(e: &Engine) -> usize {
+        e.pg.graph().approx_bytes() + e.pg.graph().edge_count() * 33
+    }
+
+    /// Sum the estimate over open DBs (skipping write-locked ones).
+    fn open_bytes(&self) -> usize {
+        self.dbs
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|db| db.engine.try_read().ok().map(|e| Self::engine_bytes(&e)))
+            .sum()
+    }
+
+    /// Evict idle (unreferenced) DBs, least-recently-used first, until the
+    /// server estimate is at or under `budget`. Returns evicted names.
+    fn evict_until(&self, budget: usize) -> Vec<String> {
+        let mut evicted = Vec::new();
+        loop {
+            if self.open_bytes() <= budget {
+                break;
+            }
+            let mut map = self.dbs.write().unwrap();
+            let victim = map
+                .iter()
+                .filter(|(_, db)| Arc::strong_count(db) == 1)
+                .min_by_key(|(_, db)| *db.last_used.lock().unwrap())
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    map.remove(&k);
+                    evicted.push(k);
+                }
+                None => break, // nothing idle left to evict
+            }
+        }
+        evicted
     }
 
     /// Flush every open database: WAL fsync + sidecar snapshot. Used at
@@ -715,7 +763,10 @@ fn prometheus_metrics(reg: &Arc<Registry>) -> Resp {
     reg.metrics.render(&mut out);
     let dbs = reg.dbs.read().unwrap();
     out.push_str(&format!("# TYPE psyrag_open_dbs gauge\npsyrag_open_dbs {}\n", dbs.len()));
-    out.push_str("# TYPE psyrag_db_nodes gauge\n# TYPE psyrag_db_edges_live gauge\n# TYPE psyrag_db_edges_dead gauge\n# TYPE psyrag_db_lambda_scale gauge\n# TYPE psyrag_db_ewma_mass gauge\n# TYPE psyrag_db_traces gauge\n# TYPE psyrag_db_wedged gauge\n# TYPE psyrag_db_wal_lsn gauge\n");
+    out.push_str("# TYPE psyrag_db_nodes gauge\n# TYPE psyrag_db_edges_live gauge\n# TYPE psyrag_db_edges_dead gauge\n# TYPE psyrag_db_lambda_scale gauge\n# TYPE psyrag_db_ewma_mass gauge\n# TYPE psyrag_db_traces gauge\n# TYPE psyrag_db_wedged gauge\n# TYPE psyrag_db_wal_lsn gauge\n# TYPE psyrag_db_approx_bytes gauge\n");
+    if reg.opts.max_mem_bytes > 0 {
+        out.push_str(&format!("# TYPE psyrag_mem_budget_bytes gauge\npsyrag_mem_budget_bytes {}\n", reg.opts.max_mem_bytes));
+    }
     for (name, db) in dbs.iter() {
         let Ok(e) = db.engine.try_read() else { continue };
         let st = e.layer.stats(e.pg.graph());
@@ -727,10 +778,47 @@ fn prometheus_metrics(reg: &Arc<Registry>) -> Resp {
         out.push_str(&format!("psyrag_db_traces{{db=\"{name}\"}} {}\n", e.traces.len()));
         out.push_str(&format!("psyrag_db_wedged{{db=\"{name}\"}} {}\n", u8::from(e.wedged.is_some())));
         out.push_str(&format!("psyrag_db_wal_lsn{{db=\"{name}\"}} {}\n", e.pg.lsn()));
+        out.push_str(&format!("psyrag_db_approx_bytes{{db=\"{name}\"}} {}\n", Registry::engine_bytes(&e)));
     }
     Response::from_string(out)
         .with_status_code(200)
         .with_header("Content-Type: text/plain; version=0.0.4; charset=utf-8".parse::<tiny_http::Header>().unwrap())
+}
+
+/// Enforce per-DB quotas (507) and the server memory budget (429, after
+/// attempting idle eviction). None = capacity available.
+fn check_capacity(reg: &Arc<Registry>, db: &Arc<Db>) -> Option<Resp> {
+    let (bytes, edges) = {
+        let e = db.engine.read().unwrap();
+        (Registry::engine_bytes(&e), e.pg.graph().edge_count())
+    };
+    let o = &reg.opts;
+    if o.max_db_bytes > 0 && bytes >= o.max_db_bytes {
+        return Some(err(
+            &format!("database over size quota ({bytes} >= {} bytes); checkpoint/purge to reclaim, or raise --max-db-mb", o.max_db_bytes),
+            507,
+        ));
+    }
+    if o.max_db_edges > 0 && edges >= o.max_db_edges {
+        return Some(err(
+            &format!("database over edge quota ({edges} >= {}); checkpoint/purge to reclaim, or raise --max-db-edges", o.max_db_edges),
+            507,
+        ));
+    }
+    if o.max_mem_bytes > 0 && reg.open_bytes() >= o.max_mem_bytes {
+        let evicted = reg.evict_until(o.max_mem_bytes);
+        if !evicted.is_empty() {
+            log::warn("budget_eviction", serde_json::json!({"evicted": evicted}));
+        }
+        if reg.open_bytes() >= o.max_mem_bytes {
+            log::warn("load_shed", serde_json::json!({"used": reg.open_bytes(), "budget": o.max_mem_bytes}));
+            return Some(err(
+                &format!("server over memory budget ({} >= {} bytes) and no idle databases to evict; ingest shed", reg.open_bytes(), o.max_mem_bytes),
+                429,
+            ));
+        }
+    }
+    None
 }
 
 fn list_dbs(reg: &Arc<Registry>) -> Resp {
@@ -764,6 +852,7 @@ fn list_dbs(reg: &Arc<Registry>) -> Resp {
                     "edges": e.pg.graph().edge_count(),
                     "traces": e.traces.len(),
                     "wedged": e.wedged,
+                    "approx_bytes": Registry::engine_bytes(&e),
                 }),
                 Err(_) => serde_json::json!({"db": n, "open": true, "busy": true}),
             },
@@ -980,6 +1069,14 @@ fn handle_db(
                     &format!("database is wedged read-only (WAL write failed: {w}); restart the server after fixing the disk"),
                     503,
                 );
+            }
+            // Growth quotas gate ingest only: maintenance (consolidate,
+            // checkpoint, purge, sleep) and feedback must keep working on a
+            // full database or there is no way back under quota.
+            if path == "/ingest" {
+                if let Some(resp) = check_capacity(reg, db) {
+                    return resp;
+                }
             }
             let Some(key) = idem_key else {
                 return handle_db_write(reg, db, method, path, body).into_resp(false);
