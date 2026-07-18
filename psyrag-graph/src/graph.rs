@@ -14,7 +14,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 /// Unix milliseconds. Kept as a plain i64 to stay dependency-free.
@@ -199,6 +199,21 @@ pub struct TemporalGraph {
     /// observation (append-only, so it only grows; rebuilt structures start
     /// fresh). An ESTIMATE for quota/budget decisions, not an exact RSS.
     approx_bytes: usize,
+    /// Inverted token index over node names: lowercase alphanumeric runs of
+    /// the name -> NodeIds containing them. Powers O(log N + hits) seed
+    /// matching instead of a full-name scan. BTreeMap so token-PREFIX
+    /// queries are range scans.
+    name_index: BTreeMap<String, Vec<NodeId>>,
+}
+
+/// Lowercase alphanumeric runs of a name, minimum 2 chars: the indexable
+/// tokens. "svc/metering-api" -> ["svc", "metering", "api"].
+fn name_tokens(name: &str) -> Vec<String> {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(str::to_string)
+        .collect()
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -334,6 +349,13 @@ impl TemporalGraph {
         }
         let id = self.nodes.len() as NodeId;
         self.approx_bytes += NODE_OVERHEAD + name.len() * 2; // node + index key
+        for tok in name_tokens(name) {
+            self.approx_bytes += tok.len() + 28; // token entry + id slot
+            let ids = self.name_index.entry(tok).or_default();
+            if ids.last() != Some(&id) {
+                ids.push(id);
+            }
+        }
         self.nodes.push(Node {
             name: name.to_string(),
             type_id,
@@ -577,6 +599,30 @@ impl TemporalGraph {
     }
 
     // -- Temporal queries ----------------------------------------------------
+
+    /// Resolve free-text tokens to node ids via the name index: each query
+    /// token matches nodes whose name contains a token equal to it or
+    /// PREFIXED by it ("meter" finds "svc/metering-api"). Results are
+    /// deterministic (ascending NodeId), capped at `limit`.
+    pub fn match_tokens(&self, tokens: &[String], limit: usize) -> Vec<NodeId> {
+        let mut hits: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        for q in tokens {
+            let q = q.to_lowercase();
+            if q.is_empty() {
+                continue;
+            }
+            for (tok, ids) in self.name_index.range(q.clone()..) {
+                if !tok.starts_with(&q) {
+                    break;
+                }
+                hits.extend(ids.iter().copied());
+                if hits.len() >= limit.saturating_mul(4) {
+                    break;
+                }
+            }
+        }
+        hits.into_iter().take(limit).collect()
+    }
 
     /// Names of all nodes alive at t.
     pub fn alive_at(&self, t: Ts) -> Vec<&str> {

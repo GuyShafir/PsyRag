@@ -945,6 +945,11 @@ fn handle_db(
                 tokens: Vec<String>,
                 #[serde(default = "d_match_limit")]
                 limit: usize,
+                /// "token" (default): indexed token-prefix matching,
+                /// O(log N + hits). "substring": legacy full-name substring
+                /// scan, O(nodes) — for mid-token needles.
+                #[serde(default)]
+                mode: Option<String>,
             }
             let r: MatchReq = match serde_json::from_str(body) {
                 Ok(r) => r,
@@ -952,18 +957,28 @@ fn handle_db(
             };
             let e = db.engine.read().unwrap();
             let g = e.pg.graph();
-            let toks: Vec<String> = r.tokens.iter().map(|t| t.to_lowercase()).collect();
-            let mut hits = Vec::new();
-            for id in 0..g.node_count() {
-                let name = g.node_name(id as u32);
-                let lname = name.to_lowercase();
-                if toks.iter().any(|t| !t.is_empty() && lname.contains(t.as_str())) {
-                    hits.push(name.to_string());
-                    if hits.len() >= r.limit {
-                        break;
+            let hits: Vec<String> = match r.mode.as_deref() {
+                Some("substring") => {
+                    let toks: Vec<String> = r.tokens.iter().map(|t| t.to_lowercase()).collect();
+                    let mut hits = Vec::new();
+                    for id in 0..g.node_count() {
+                        let name = g.node_name(id as u32);
+                        let lname = name.to_lowercase();
+                        if toks.iter().any(|t| !t.is_empty() && lname.contains(t.as_str())) {
+                            hits.push(name.to_string());
+                            if hits.len() >= r.limit {
+                                break;
+                            }
+                        }
                     }
+                    hits
                 }
-            }
+                _ => g
+                    .match_tokens(&r.tokens, r.limit)
+                    .into_iter()
+                    .map(|id| g.node_name(id).to_string())
+                    .collect(),
+            };
             json_resp(&serde_json::json!({ "nodes": hits }), 200)
         }
         (Method::Post, "/retrieve") => {

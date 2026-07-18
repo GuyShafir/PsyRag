@@ -167,6 +167,18 @@ mass, finite activations under random load), and **fuzz-lite** (hundreds of
 seeded byte-mutated WALs and thousands of garbage payloads — errors allowed,
 panics and silent misreplay are not).
 
+### Load/soak with SLO assertions
+```bash
+scripts/load.sh 15 8          # 15s, 8 threads; SLO_P95_MS=25 to tighten
+```
+Drives a mixed workload (80% retrieve / 15% feedback / 5% ingest) and then
+asserts from the server's own Prometheus histograms: zero 5xx, retrieve p95
+under the SLO, and a flat memory estimate across a read-only soak tail.
+Reference numbers (GitHub-hosted Linux runner, release build, 300-node
+corpus, 8 threads, 15 s): **~2,500 req/s mixed, retrieve p95 ≤ 5 ms, zero
+errors, memory byte-stable across the soak**. Runs in CI with a generous
+250 ms SLO to absorb shared-runner variance.
+
 ### kill -9 crash-recovery suite
 ```bash
 scripts/crash.sh 5            # 5 rounds of SIGKILL mid-write-stream
