@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, production-hardening]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -16,8 +16,10 @@ jobs:
         run: cargo build --release --workspace
       - name: Unit + integration tests (incl. golden suite + format fixture zoo)
         run: cargo test --workspace
-      - name: End-to-end smoke suite (16 assertions)
+      - name: End-to-end smoke suite
         run: bash scripts/smoke.sh
+      - name: kill -9 crash-recovery suite (acked-write durability)
+        run: bash scripts/crash.sh 5
 
   supply-chain:
     runs-on: ubuntu-latest

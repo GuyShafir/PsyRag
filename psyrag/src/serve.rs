@@ -99,49 +99,19 @@ impl JsonOut {
     }
 }
 
-/// In-memory idempotent-retry dedup: replays the stored response for a
-/// repeated (endpoint, Idempotency-Key) within the window. Dedup spans the
-/// process lifetime only — durable dedup across restarts is future work
-/// (needs WAL stamping).
-const IDEM_CAP: usize = 4096;
-const IDEM_WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// Idempotency parameters: replay window, entry cap (both enforced by the
+/// durable engine-level `IdemStore`), and the staleness bound for the
+/// in-memory in-flight markers that serialize concurrent duplicates.
+pub const IDEM_CAP: usize = 4096;
+pub const IDEM_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const IDEM_INFLIGHT_STALE: Duration = Duration::from_secs(60);
-
-enum IdemEntry {
-    InFlight { at: Instant },
-    Done { code: u16, body: Vec<u8>, at: Instant },
-}
-#[derive(Default)]
-struct IdemCache {
-    map: HashMap<String, IdemEntry>,
-    order: std::collections::VecDeque<String>,
-}
-impl IdemCache {
-    fn evict(&mut self) {
-        while self.order.len() > IDEM_CAP {
-            if let Some(k) = self.order.pop_front() {
-                self.map.remove(&k);
-            }
-        }
-        while let Some(k) = self.order.front() {
-            let stale = match self.map.get(k) {
-                Some(IdemEntry::Done { at, .. }) => at.elapsed() > IDEM_WINDOW,
-                Some(IdemEntry::InFlight { .. }) | None => false,
-            };
-            if stale {
-                let k = self.order.pop_front().unwrap();
-                self.map.remove(&k);
-            } else {
-                break;
-            }
-        }
-    }
-}
 
 struct Db {
     engine: RwLock<Engine>,
     last_used: Mutex<Instant>,
-    idem: Mutex<IdemCache>,
+    /// In-flight idempotency keys (memory-only: an in-flight marker that
+    /// died with a crash SHOULD be retryable).
+    inflight: Mutex<HashMap<String, Instant>>,
     /// Where this DB's config.json lives (multi-DB mode) — quarantine
     /// updates persist there so trust survives restarts.
     cfg_path: Option<PathBuf>,
@@ -169,11 +139,13 @@ fn open_engine_at(wal: &str, sidecar: &str, cfg: Config) -> Result<Engine, Strin
     layer.load_if_exists(pg.graph(), sidecar)?;
     layer.sync(pg.graph());
     let traces = TraceStore::open(4096, &format!("{sidecar}.traces.jsonl"));
+    let idem = crate::engine::IdemStore::open(IDEM_CAP, IDEM_WINDOW_MS, &format!("{sidecar}.idem.jsonl"));
     Ok(Engine {
         pg,
         layer,
         sidecar_path: sidecar.to_string(),
         traces,
+        idem,
         wedged: None,
     })
 }
@@ -264,7 +236,7 @@ impl Registry {
         let db = Arc::new(Db {
             engine: RwLock::new(engine),
             last_used: Mutex::new(Instant::now()),
-            idem: Mutex::new(IdemCache::default()),
+            inflight: Mutex::new(HashMap::new()),
             cfg_path,
         });
         map.insert(name.to_string(), db.clone());
@@ -851,6 +823,7 @@ fn list_dbs(reg: &Arc<Registry>) -> Resp {
                     "nodes": e.pg.graph().node_count(),
                     "edges": e.pg.graph().edge_count(),
                     "traces": e.traces.len(),
+                    "idem_entries": e.idem.len(),
                     "wedged": e.wedged,
                     "approx_bytes": Registry::engine_bytes(&e),
                 }),
@@ -1081,41 +1054,40 @@ fn handle_db(
             let Some(key) = idem_key else {
                 return handle_db_write(reg, db, method, path, body).into_resp(false);
             };
-            // Idempotent retry: replay the stored response for a repeated
-            // (endpoint, key); serialize concurrent duplicates.
+            // Idempotent retry: replay the stored final response for a
+            // repeated (endpoint, key) — durably, so the dedup survives a
+            // restart. Concurrent duplicates are serialized in memory (an
+            // in-flight marker that died with a crash SHOULD be retryable).
             let cache_key = format!("{method} {path} {key}");
+            if let Some((code, body)) = db.engine.read().unwrap().idem.get(&cache_key) {
+                return JsonOut { code, body: body.into_bytes() }.into_resp(true);
+            }
             {
-                let mut c = db.idem.lock().unwrap();
-                c.evict();
-                match c.map.get(&cache_key) {
-                    Some(IdemEntry::Done { code, body, .. }) => {
-                        return JsonOut { code: *code, body: body.clone() }.into_resp(true);
-                    }
-                    Some(IdemEntry::InFlight { at }) if at.elapsed() < IDEM_INFLIGHT_STALE => {
+                let mut inflight = db.inflight.lock().unwrap();
+                inflight.retain(|_, at| at.elapsed() < IDEM_INFLIGHT_STALE);
+                match inflight.get(&cache_key) {
+                    Some(_) => {
                         return err("a request with this Idempotency-Key is already in flight", 409);
                     }
-                    _ => {
-                        if !c.map.contains_key(&cache_key) {
-                            c.order.push_back(cache_key.clone());
-                        }
-                        c.map.insert(cache_key.clone(), IdemEntry::InFlight { at: Instant::now() });
+                    None => {
+                        inflight.insert(cache_key.clone(), Instant::now());
                     }
                 }
             }
             let out = handle_db_write(reg, db, method, path, body);
-            let mut c = db.idem.lock().unwrap();
             if out.code < 500 {
-                // Cache final outcomes (2xx/4xx). 5xx are transient: the
-                // retry SHOULD reprocess, so drop the in-flight marker.
-                c.map.insert(
-                    cache_key,
-                    IdemEntry::Done { code: out.code, body: out.body.clone(), at: Instant::now() },
-                );
-            } else {
-                c.map.remove(&cache_key);
-                c.order.retain(|k| k != &cache_key);
+                // Persist the final outcome (2xx/4xx) BEFORE responding, so
+                // an acked response is always replayable. If persisting the
+                // dedup record fails we still return the ORIGINAL response:
+                // the operation itself is already durable, and a 5xx here
+                // would trigger an immediate retry with no dedup record —
+                // the exact double-apply this exists to prevent.
+                let body_str = String::from_utf8_lossy(&out.body).into_owned();
+                if let Err(er) = db.engine.write().unwrap().idem.put(&cache_key, out.code, &body_str) {
+                    log::error("idem_persist_failed", serde_json::json!({"key": cache_key, "error": er}));
+                }
             }
-            drop(c);
+            db.inflight.lock().unwrap().remove(&cache_key);
             out.into_resp(false)
         }
     }

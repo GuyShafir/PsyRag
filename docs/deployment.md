@@ -160,6 +160,17 @@ Three ways to verify, plus the console for manual exploration.
 cargo test --release          # 26 tests: psyrag-graph (12) + psyrag-core (13) + monitor (1)
 ```
 
+### kill -9 crash-recovery suite
+```bash
+scripts/crash.sh 5            # 5 rounds of SIGKILL mid-write-stream
+```
+Each round streams rapid ingests, SIGKILLs the server at a random moment,
+then asserts: the WAL verifies (torn tail repaired, no corruption), **every
+acked (2xx) write is present after restart** — the fsync contract under
+real crashes — and the recovered server accepts new writes. The WAL
+persists across rounds, so later rounds recover a log that has already
+survived earlier crashes. Runs in CI on every push.
+
 ### Scripted end-to-end suite (the one to run)
 ```bash
 scripts/smoke.sh              # ./target/release/psyrag on port 8791
@@ -190,9 +201,11 @@ Asserts, exiting non-zero on any failure:
 16. **ENOSPC fault injection** — on a tiny ram-disk/tmpfs: disk-full ingest
     fails clean, the DB wedges (reads keep serving, writes 503), and a
     restart on the still-full volume recovers. Skipped where no ram-disk
-    can be created.
+    can be created,
+17. **durable idempotency** — an Idempotency-Key retry AFTER a server
+    restart still replays the original response from the fsynced log.
 
-Expected tail: `==== 30 passed, 0 failed ====` (34 with the ENOSPC section).
+Expected tail: `==== 32 passed, 0 failed ====` (37 with the ENOSPC section).
 
 ### Python / ADK
 ```bash

@@ -231,6 +231,25 @@ else
   if [ "$(uname)" = "Darwin" ]; then hdiutil detach "$EVOL" -force >/dev/null 2>&1; else sudo -n umount "$EVOL" 2>/dev/null; fi
 fi
 
+echo "== 17. durable idempotency: replay survives restart =="
+DWAL="$WORK/didem.wal"; DPORT=$((PORT+6)); DURL="http://127.0.0.1:${DPORT}"
+"$BIN" --wal "$DWAL" serve --addr "127.0.0.1:${DPORT}" >"$WORK/serve-d.log" 2>&1 &
+DSRV=$!; sleep 1.5
+DH='Idempotency-Key: durable-key-1'
+curl -s -X POST "$DURL/ingest" -H 'Content-Type: application/json' \
+  -d '{"json":"[{\"name\":\"seedn\",\"type\":\"t\",\"edges\":[{\"dst\":\"tgt\",\"kind\":\"R\"}]}]","ts":1000}' >/dev/null
+R1=$(curl -s -H "$DH" -X POST "$DURL/feedback" -H 'Content-Type: application/json' \
+  -d '{"seeds":["seedn"],"used":["tgt"],"ts":2000}')
+kill $DSRV 2>/dev/null; sleep 0.7
+"$BIN" --wal "$DWAL" serve --addr "127.0.0.1:${DPORT}" >"$WORK/serve-d2.log" 2>&1 &
+DSRV=$!; sleep 1.5
+R2=$(curl -sD "$WORK/didem.hdr" -H "$DH" -X POST "$DURL/feedback" -H 'Content-Type: application/json' \
+  -d '{"seeds":["seedn"],"used":["tgt"],"ts":2000}')
+[ "$R1" = "$R2" ] && ok "post-restart retry replayed the original response" || no "responses differ across restart"
+grep -qi "idempotency-replayed: true" "$WORK/didem.hdr" \
+  && ok "post-restart retry served from the DURABLE replay log" || no "restart lost the dedup record"
+kill $DSRV 2>/dev/null; sleep 0.5
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]
