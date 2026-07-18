@@ -14,7 +14,8 @@
 //!   psyrag purge --origin PREFIX            (drop every fact from a provenance)
 //!   psyrag db {list | create NAME}          (requires --data-dir)
 //!   psyrag serve [--addr HOST:PORT] [--token T] [--read-token T] [--workers N]
-//!                [--max-body-mb N] [--max-open-dbs N]
+//!                [--max-body-mb N] [--max-open-dbs N] [--log-format json|text]
+//!                [--sleep-every D] [--consolidate-every D] [--checkpoint-every D]
 //!   psyrag monitor [--url URL] [--interval-ms N]
 //! Global: --wal PATH  --sidecar PATH  --config PATH.json
 //!         --data-dir DIR  --db NAME     (multi-database layout)
@@ -23,8 +24,10 @@ mod args;
 mod config;
 mod engine;
 mod export;
+mod log;
 mod metrics;
 mod monitor;
+mod prom;
 mod serve;
 
 use args::Args;
@@ -71,6 +74,22 @@ fn db_paths(a: &Args) -> Result<(String, String, Option<String>), String> {
             Ok((wal, sidecar, None))
         }
     }
+}
+
+/// Parse a human interval: "90s", "30m", "24h", "7d", or bare seconds.
+fn parse_every(s: &str) -> Result<std::time::Duration, String> {
+    let (num, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1u64),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        _ => (s, 1),
+    };
+    let n: u64 = num.parse().map_err(|_| format!("bad interval '{s}' (want e.g. 90s, 30m, 24h)"))?;
+    if n == 0 {
+        return Err(format!("interval '{s}' must be > 0"));
+    }
+    Ok(std::time::Duration::from_secs(n * mult))
 }
 
 fn open_engine(a: &Args) -> Result<Engine, String> {
@@ -414,6 +433,14 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 .get("sidecar")
                 .map(String::from)
                 .unwrap_or_else(|| format!("{wal}.psyrag.json"));
+            match a.get_or("log-format", "text") {
+                "json" => log::set_format(log::Format::Json),
+                "text" => log::set_format(log::Format::Text),
+                other => return Err(format!("bad --log-format '{other}' (want json|text)")),
+            }
+            let every = |key: &str| -> Result<Option<std::time::Duration>, String> {
+                a.get(key).map(parse_every).transpose()
+            };
             let workers = a.get_usize("workers").unwrap_or_else(|| {
                 std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4)
             });
@@ -434,6 +461,9 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 max_body: a.get_usize("max-body-mb").unwrap_or(32) * 1024 * 1024,
                 workers,
                 max_open_dbs: a.get_usize("max-open-dbs").unwrap_or(64),
+                sleep_every: every("sleep-every")?,
+                consolidate_every: every("consolidate-every")?,
+                checkpoint_every: every("checkpoint-every")?,
             };
             serve::run(opts)?;
         }

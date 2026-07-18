@@ -143,6 +143,10 @@ Run the HTTP server with the web console at `/`.
 | `--workers N` | `min(cores, 8)` | request worker threads |
 | `--max-body-mb N` | 32 | request body cap (oversize → 413) |
 | `--max-open-dbs N` | 64 | concurrently open databases (LRU-evicts idle ones) |
+| `--log-format F` | `text` | `json` for structured one-object-per-line logs on stderr |
+| `--sleep-every D` | — | run sleep on every open DB each interval (`90s`/`30m`/`24h`) |
+| `--consolidate-every D` | — | run consolidation each interval |
+| `--checkpoint-every D` | — | run WAL checkpoint each interval |
 
 The server drains and flushes every open database on SIGINT/SIGTERM (clean
 Docker stops). Without `--data-dir` it serves the single `--wal` database.
@@ -160,6 +164,9 @@ of them with `/db/{name}` to address another database (multi-DB mode):
 `POST /db/tenant-a/retrieve`, `GET /db/tenant-a/stats`, … Databases are fully
 isolated — separate WAL, sidecar, traces, config, and locks; one DB's ingest
 never blocks another DB's retrieval.
+
+**API version.** Every response carries `X-PsyRag-Api: 1`. The wire API is
+versioned independently of the on-disk formats; breaking changes bump it.
 
 **Idempotent retries.** Every mutating endpoint accepts an
 `Idempotency-Key` header. A repeated (endpoint, key) within the window
@@ -187,6 +194,14 @@ Create (or ensure) a database. Requires multi-DB mode and write scope.
 Drop a database — closes it and deletes its directory. Irreversible, so it is
 disabled unless the server runs with `--token`; returns 409 while requests are
 in flight.
+
+### `GET /metrics`
+Prometheus exposition (text format): `psyrag_requests_total{route,status}`,
+`psyrag_request_duration_seconds` histograms per route class,
+`psyrag_uptime_seconds`, `psyrag_open_dbs`, and per-database gauges
+(`psyrag_db_nodes/edges_live/edges_dead/lambda_scale/ewma_mass/traces/wedged/wal_lsn{db=...}`).
+Request labels use a closed route-class set, so cardinality is bounded.
+JSON stats remain at `GET /stats` (used by the console and `psyrag monitor`).
 
 ### `GET /live` and `GET /ready`
 Liveness / readiness probes (readiness implies the default DB replayed
