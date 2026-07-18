@@ -50,3 +50,31 @@ fn approx_bytes_shrinks_after_purge() {
     assert!(after < before, "purge rebuild shrinks the estimate: {before} -> {after}");
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn token_index_matches_by_token_prefix_deterministically() {
+    let mut g = TemporalGraph::new();
+    psyrag_graph::entity::ingest_entities_mem(
+        &mut g,
+        r#"[{"name":"svc/metering-api","type":"t"},
+            {"name":"svc/billing","type":"t"},
+            {"name":"db/metrics-store","type":"t"}]"#,
+        0,
+        false,
+    )
+    .unwrap();
+    let names = |ids: Vec<u32>| -> Vec<String> {
+        ids.into_iter().map(|i| g.node_name(i).to_string()).collect()
+    };
+    // exact token
+    assert_eq!(names(g.match_tokens(&["billing".into()], 10)), ["svc/billing"]);
+    // token prefix spans multiple nodes, ascending NodeId order
+    assert_eq!(
+        names(g.match_tokens(&["met".into()], 10)),
+        ["svc/metering-api", "db/metrics-store"]
+    );
+    // case-insensitive, multi-token union, limit respected
+    assert_eq!(g.match_tokens(&["SVC".into(), "db".into()], 2).len(), 2);
+    // mid-token substring does NOT match in token mode (documented change)
+    assert!(g.match_tokens(&["eter".into()], 10).is_empty());
+}

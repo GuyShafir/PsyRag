@@ -244,8 +244,12 @@ read scope. Retrieval is deterministic: identical inputs at an identical `ts`
 return identical results (ties break by ingestion order).
 
 ### `POST /match`
-`{ "tokens": [..], "limit"? }` → `{ "nodes": [names] }`. Resolve free-text tokens
-to existing node names (substring, case-insensitive). Used for seed selection.
+`{ "tokens": [..], "limit"?, "mode"? }` → `{ "nodes": [names] }`. Resolve
+free-text tokens to node names for seed selection. Default mode `"token"`
+uses an inverted index over name tokens (case-insensitive, token-**prefix**
+matching: `meter` finds `svc/metering-api`) — O(log N + hits), deterministic
+ascending-id order. `"mode": "substring"` restores the legacy full-name
+substring scan (O(nodes)) for mid-token needles.
 
 ### `POST /feedback`
 Provide **one** target and **one** credit spec.
