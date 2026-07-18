@@ -55,12 +55,15 @@ own `config.json` > built-in defaults. DB names match `[a-z0-9_-]{1,64}`.
 Print the effective config as JSON, or with `--write` emit a fully-commented
 example to `PATH`.
 
-### `psyrag ingest --file F [--reconcile] [--cai] [--ts MS]`
+### `psyrag ingest --file F [--reconcile] [--cai] [--ts MS] [--origin LABEL]`
 Ingest entity JSON into the WAL, then sync the sidecar.
 - `--file` — entity array / NDJSON, or a Cloud Asset Inventory snapshot with `--cai`.
 - `--reconcile` — treat the snapshot as ground truth (retire missing edges).
 - `--cai` — parse a GCP CAI export (requires the `gcp` build feature).
 - `--ts` — event time in ms (default: now).
+- `--origin` — provenance label for every fact in the batch (a per-entity
+  `"origin"` field in the payload overrides it). Conventions like
+  `user:alice/session:42` enable per-source trust and purge-by-subject.
 
 ### `psyrag retrieve --seed N [--seed N…] [--depth D] [--fan F] [--top-k K] [--ts MS] [--adapt]`
 Weighted spreading-activation retrieval.
@@ -113,6 +116,16 @@ Consistent file-copy backup of the database (WAL + sidecar + trace log +
 `config.json` if present) plus a `manifest.json`. Takes the WAL lock without
 replaying, so it fails fast if a server owns the database — stop the server
 first or use filesystem snapshots. Restore = copy the files back.
+
+### `psyrag purge --origin PREFIX`
+**Irreversibly delete** every fact whose provenance matches the prefix: nodes
+whose current version came from it, edges observed from it, and edges
+touching a purged node. The WAL is rewritten without the data (the purged
+names are gone from the bytes, not just masked) and never archived by this
+path. Learned salience for surviving edges carries over via stable keys.
+Pre-existing archives and backups still contain the data — rotate them.
+This is the GDPR deletion-by-subject path. Offline form; live servers use
+`POST /purge`.
 
 ### `psyrag db {list | create NAME} --data-dir DIR`
 Manage the multi-database layout from the CLI: `list` prints every database
@@ -222,6 +235,20 @@ bytes_after, archive }, traces_cleared, note }`. Compacts this database's WAL
 in place (see `psyrag checkpoint`); the server keeps running and keeps its
 full in-memory history until restart. Stored trace_ids are invalidated.
 
+### `POST /quarantine`
+`{ "origin_prefix": "...", "trust": 0.0 }` — set the trust level for a
+provenance prefix (longest prefix wins). Trust multiplies edge salience at
+retrieval time only: `0.0` removes the source's influence entirely, and
+restoring `1.0` restores recall — learned weights are never modified. In
+multi-DB mode the updated config persists to the DB's `config.json`.
+Config equivalent: `trust_by_origin: {"user:mallory": 0.0}`.
+
+### `POST /purge`
+`{ "origin_prefix": "..." }` → `{ report: { nodes_dropped, edges_dropped,
+... }, traces_cleared }`. Irreversible content deletion by provenance (see
+`psyrag purge`); in-memory removal is immediate, no restart needed. Like
+`DELETE /db/{name}`, disabled unless the server runs with `--token`.
+
 ### `POST /consolidate`
 `{ "ts"?, "apply_conflicts"?: bool }` → `{ stats, conflicts, applied_ops }`.
 
@@ -281,6 +308,11 @@ Every field is optional; omitted fields take the default shown.
 | `authority_by_kind` | `{}` | per-kind authority (raises decay resistance) |
 | `authority_default` | 0.0 | authority for unlisted kinds |
 | `functional_kinds` | `[]` | single-valued predicates (only these are conflict-checked) |
+
+### Provenance & trust
+| key | default | meaning |
+|-----|---------|---------|
+| `trust_by_origin` | `{}` | origin-prefix → trust multiplier on retrieval (longest prefix wins; 0.0 = quarantined, unlisted = 1.0) |
 
 ### Feedback
 | key | default | meaning |

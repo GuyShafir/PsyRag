@@ -120,6 +120,7 @@ pub fn asset_ops(asset: &CaiAsset, ts: Ts) -> (Vec<Op>, Vec<String>) {
         .unwrap_or(Value::Null);
 
     ops.push(Op::ObserveNode {
+        origin: None,
         name: asset.name.clone(),
         asset_type: asset.asset_type.clone(),
         props: props.clone(),
@@ -134,11 +135,13 @@ pub fn asset_ops(asset: &CaiAsset, ts: Ts) -> (Vec<Op>, Vec<String>) {
             continue; // a project's own CAI record lists itself first
         }
         ops.push(Op::ObservePlaceholder {
+            origin: None,
             name: anc_name.clone(),
             inferred_type: anc_type.to_string(),
             ts,
         });
         ops.push(Op::ObserveEdge {
+            origin: None,
             src: anc_name.clone(),
             dst: child,
             kind: KIND_CONTAINS.to_string(),
@@ -157,11 +160,13 @@ pub fn asset_ops(asset: &CaiAsset, ts: Ts) -> (Vec<Op>, Vec<String>) {
             continue;
         }
         ops.push(Op::ObservePlaceholder {
+            origin: None,
             name: r.clone(),
             inferred_type: infer_type(&r),
             ts,
         });
         ops.push(Op::ObserveEdge {
+            origin: None,
             src: asset.name.clone(),
             dst: r,
             kind: KIND_REFERENCES.to_string(),

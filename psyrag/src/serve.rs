@@ -128,6 +128,9 @@ struct Db {
     engine: RwLock<Engine>,
     last_used: Mutex<Instant>,
     idem: Mutex<IdemCache>,
+    /// Where this DB's config.json lives (multi-DB mode) — quarantine
+    /// updates persist there so trust survives restarts.
+    cfg_path: Option<PathBuf>,
 }
 
 struct Registry {
@@ -176,6 +179,7 @@ impl Registry {
             return Ok(db.clone());
         }
         // Resolve on-disk paths + per-DB config.
+        let mut cfg_path: Option<PathBuf> = None;
         let (wal, sidecar, cfg) = match &self.opts.data_dir {
             None => {
                 if name != DEFAULT_DB {
@@ -201,13 +205,14 @@ impl Registry {
                         ));
                     }
                 }
-                let cfg_path = dir.join("config.json");
-                let cfg = if cfg_path.is_file() {
-                    crate::config::load(Some(cfg_path.to_str().unwrap_or_default()))
+                let cp = dir.join("config.json");
+                let cfg = if cp.is_file() {
+                    crate::config::load(Some(cp.to_str().unwrap_or_default()))
                         .map_err(|e| (500, format!("db '{name}' config: {e}")))?
                 } else {
                     self.opts.cfg.clone()
                 };
+                cfg_path = Some(cp);
                 (
                     dir.join("wal").to_string_lossy().into_owned(),
                     dir.join("sidecar.json").to_string_lossy().into_owned(),
@@ -244,6 +249,7 @@ impl Registry {
             engine: RwLock::new(engine),
             last_used: Mutex::new(Instant::now()),
             idem: Mutex::new(IdemCache::default()),
+            cfg_path,
         });
         map.insert(name.to_string(), db.clone());
         Ok(db)
@@ -309,6 +315,11 @@ struct IngestReq {
     #[serde(default)]
     cai: bool,
     ts: Option<i64>,
+    /// Provenance label for every fact in this batch (per-entity `origin`
+    /// in the payload overrides it). Conventions like
+    /// "user:alice/session:42" enable trust levels and purge-by-subject.
+    #[serde(default)]
+    origin: Option<String>,
 }
 #[derive(Deserialize)]
 struct RetrieveReq {
@@ -860,7 +871,7 @@ fn handle_db(
 }
 
 fn handle_db_write(
-    _reg: &Arc<Registry>,
+    reg: &Arc<Registry>,
     db: &Arc<Db>,
     method: &Method,
     path: &str,
@@ -897,7 +908,7 @@ fn handle_db_write(
                     Err("built without gcp feature".to_string())
                 }
             } else {
-                e.pg.ingest_entities(&r.json, ts, r.reconcile)
+                e.pg.ingest_entities_from(&r.json, ts, r.reconcile, r.origin.as_deref())
             };
             match res {
                 Ok(stale) => {
@@ -1027,6 +1038,82 @@ fn handle_db_write(
                 "traces_cleared": true,
                 "note": "in-memory graph keeps full history until restart; the on-disk log is compacted",
             }), 200)
+        }
+        (Method::Post, "/quarantine") => {
+            #[derive(Deserialize)]
+            struct QuarantineReq {
+                origin_prefix: String,
+                /// 0.0 = fully quarantined; 1.0 (or removing the entry via
+                /// config) = restored. Retrieval-time mask only.
+                #[serde(default)]
+                trust: f32,
+            }
+            let r: QuarantineReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
+            };
+            if r.origin_prefix.is_empty() {
+                return jerr("origin_prefix must be non-empty", 400);
+            }
+            if !r.trust.is_finite() || r.trust < 0.0 {
+                return jerr("trust must be a finite number >= 0", 400);
+            }
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            e.layer.set_trust(e.pg.graph(), &r.origin_prefix, r.trust);
+            // Persist into the DB's config.json so trust survives restarts
+            // (multi-DB mode; legacy mode applies in-memory only).
+            let persisted = match &db.cfg_path {
+                Some(cp) => {
+                    let s = serde_json::to_string_pretty(&e.layer.cfg).unwrap_or_default();
+                    match std::fs::write(cp, s) {
+                        Ok(()) => true,
+                        Err(er) => {
+                            return jerr(&format!("trust applied but config not persisted: {er}"), 500)
+                        }
+                    }
+                }
+                None => false,
+            };
+            jout(&serde_json::json!({
+                "origin_prefix": r.origin_prefix,
+                "trust": r.trust,
+                "persisted": persisted,
+            }), 200)
+        }
+        (Method::Post, "/purge") => {
+            #[derive(Deserialize)]
+            struct PurgeReq {
+                origin_prefix: String,
+            }
+            // Purging is irreversible content deletion; like DELETE /db it
+            // is disabled unless the operator opted into authentication.
+            if reg.opts.token.is_none() {
+                return jerr("POST /purge is disabled unless the server runs with --token", 403);
+            }
+            let r: PurgeReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return jerr(&format!("bad body: {e}"), 400),
+            };
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            // EdgeIds renumber: carry learned state across by stable key.
+            let snap = e.layer.snapshot_keys(e.pg.graph());
+            let report = match e.pg.purge(&r.origin_prefix) {
+                Ok(rep) => rep,
+                Err(msg) => {
+                    e.wedge(&msg);
+                    return jerr(&format!("purge failed; database wedged read-only: {msg}"), 500);
+                }
+            };
+            e.layer.restore_keys(e.pg.graph(), &snap);
+            if let Err(msg) = e.save_sidecar() {
+                return jerr(&format!("purge done but sidecar not persisted: {msg}"), 500);
+            }
+            if let Err(msg) = e.traces.clear() {
+                return jerr(&format!("purge done but trace log not cleared: {msg}"), 500);
+            }
+            jout(&serde_json::json!({"report": report, "traces_cleared": true}), 200)
         }
         (Method::Post, "/consolidate") => {
             let r: ConsolidateReq = if body.trim().is_empty() {

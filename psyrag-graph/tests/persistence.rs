@@ -88,6 +88,7 @@ fn torn_tail_is_tolerated() {
             asset_type: "t/x".into(),
             props: serde_json::json!({"k": 1}),
             ts: T1,
+            origin: None,
         })
         .unwrap();
         pg.flush().unwrap();
@@ -124,6 +125,7 @@ fn mid_file_corruption_is_a_hard_error() {
                 asset_type: "t/x".into(),
                 props: serde_json::Value::Null,
                 ts: T1,
+                origin: None,
             })
             .unwrap();
         }
@@ -185,6 +187,7 @@ fn compaction_preserves_open_state_and_drops_history() {
             asset_type: "t/x".into(),
             props: serde_json::Value::Null,
             ts: T2 + 10,
+            origin: None,
         })
         .unwrap();
         pg.flush().unwrap();
@@ -215,6 +218,88 @@ fn compaction_preserves_open_state_and_drops_history() {
 }
 
 #[test]
+fn origin_survives_wal_roundtrip_and_compaction() {
+    let path = std::env::temp_dir().join("psyrag_origin.wal");
+    let _ = fs::remove_file(&path);
+    let entities = r#"[
+        {"name":"a","type":"t","origin":"user:alice/s1","edges":[{"dst":"shared","kind":"REL"}]},
+        {"name":"b","type":"t","edges":[{"dst":"shared","kind":"REL"}]}
+    ]"#;
+    {
+        let mut pg = PersistentGraph::open(&path).unwrap();
+        pg.ingest_entities_from(entities, T1, false, Some("batch:default")).unwrap();
+        // per-entity origin wins over batch origin; unlabeled entity gets batch's
+        let g = pg.graph();
+        let a = g.id_of("a").unwrap();
+        let b = g.id_of("b").unwrap();
+        assert_eq!(g.node_origin_at(a, T1 + 1), "user:alice/s1");
+        assert_eq!(g.node_origin_at(b, T1 + 1), "batch:default");
+        pg.compact(false).unwrap();
+    }
+    // Provenance survives both replay and compaction.
+    let pg = PersistentGraph::open(&path).unwrap();
+    let g = pg.graph();
+    let a = g.id_of("a").unwrap();
+    assert_eq!(g.node_origin_at(a, T1 + 1), "user:alice/s1");
+    let a_edge = g.out_edge_ids(a)[0];
+    assert_eq!(g.edge_origin(a_edge), "user:alice/s1");
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn purge_removes_a_subject_completely() {
+    let path = std::env::temp_dir().join("psyrag_purge.wal");
+    let _ = fs::remove_file(&path);
+    // `shared` gets its OWN record (origin infra:catalog), so it survives the
+    // purge of alice even though her data referenced it first. A name that
+    // exists ONLY as a placeholder from the purged subject's data would be
+    // dropped too — conservative for privacy, since the name itself came
+    // from the subject.
+    let entities = r#"[
+        {"name":"alice-secret","type":"t","origin":"user:alice/s1",
+         "edges":[{"dst":"shared","kind":"REL"}]},
+        {"name":"bob-fact","type":"t","origin":"user:bob/s7",
+         "edges":[{"dst":"shared","kind":"REL"},{"dst":"alice-secret","kind":"MENTIONS"}]},
+        {"name":"shared","type":"t","origin":"infra:catalog"}
+    ]"#;
+    {
+        let mut pg = PersistentGraph::open(&path).unwrap();
+        pg.ingest_entities_from(entities, T1, false, None).unwrap();
+        let rep = pg.purge("user:alice").unwrap();
+        assert_eq!(rep.nodes_dropped, 1, "alice-secret dropped: {rep:?}");
+        // alice's own edge + bob's edge POINTING AT the purged node both go
+        // (keeping bob's would resurrect the purged name as a placeholder)
+        assert_eq!(rep.edges_dropped, 2, "{rep:?}");
+        // in-memory removal is immediate, no restart needed
+        let g = pg.graph();
+        assert!(g.id_of("alice-secret").is_none());
+        assert!(g.id_of("bob-fact").is_some());
+        assert!(g.id_of("shared").is_some(), "properly-observed shared node survives");
+        // bob's edge to shared survived
+        let bob = g.id_of("bob-fact").unwrap();
+        assert_eq!(g.out_edge_ids(bob).iter().filter(|&&e| g.edge(e).alive_at(T1 + 1)).count(), 1);
+    }
+    // The purged name is gone from the BYTES of the log, not just the graph.
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("alice-secret"), "name absent from disk");
+    assert!(raw.contains("bob-fact"));
+    // And from a fresh replay.
+    let pg = PersistentGraph::open(&path).unwrap();
+    assert!(pg.graph().id_of("alice-secret").is_none());
+    assert!(pg.graph().id_of("bob-fact").is_some());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn purge_refuses_empty_prefix() {
+    let path = std::env::temp_dir().join("psyrag_purge_empty.wal");
+    let _ = fs::remove_file(&path);
+    let mut pg = PersistentGraph::open(&path).unwrap();
+    assert!(pg.purge("").is_err());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn legacy_v0_wal_replays_and_mixes_with_framed_appends() {
     let path = std::env::temp_dir().join("psyrag_legacy.wal");
     let _ = fs::remove_file(&path);
@@ -238,6 +323,7 @@ fn legacy_v0_wal_replays_and_mixes_with_framed_appends() {
             asset_type: "t/x".into(),
             props: serde_json::Value::Null,
             ts: T2,
+            origin: None,
         })
         .unwrap();
         pg.flush().unwrap();

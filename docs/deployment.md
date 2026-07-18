@@ -44,6 +44,12 @@ psyrag serve --addr 0.0.0.0:8080 --token "$ADMIN_TOKEN" --read-token "$VIEWER_TO
   binds. `DELETE /db/{name}` is disabled entirely in open mode.
 - TLS: terminate at a reverse proxy (nginx/Caddy/Cloud Run); the server
   speaks plain HTTP.
+- **Content poisoning & GDPR**: label ingests with provenance
+  (`origin: "user:alice/session:42"`). A source that turns out hostile can be
+  quarantined instantly (`POST /quarantine`, trust 0.0 — reversible mask) and
+  its facts hard-deleted (`POST /purge` / `psyrag purge` — rewrites the WAL
+  without the data). Purge is also the deletion-by-subject path for GDPR;
+  remember pre-existing archives/backups still hold the data.
 - **Traces are sensitive data**: the durable trace log persists retrieval
   structure derived from queries/conversations to disk unencrypted, and the
   WAL persists ingested facts. Encrypt the volume (LUKS/EBS/PD encryption)
@@ -148,9 +154,11 @@ Asserts, exiting non-zero on any failure:
     the id renumbering (stable sidecar keys),
 11. **backup** — manifest + consistent file set,
 12. **idempotent retry** — a repeated Idempotency-Key returns the identical
-    response from the replay cache and never double-applies.
+    response from the replay cache and never double-applies,
+13. **provenance** — quarantine masks a hostile origin from recall; purge
+    removes its facts from the WAL bytes; unrelated facts survive restart.
 
-Expected tail: `==== 18 passed, 0 failed ====`.
+Expected tail: `==== 23 passed, 0 failed ====`.
 
 ### Python / ADK
 ```bash

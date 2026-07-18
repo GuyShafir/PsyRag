@@ -64,6 +64,7 @@ fn main() {
     let t = Instant::now();
     for i in 0..N {
         OpSink::record(&mut pg, Op::ObserveNode {
+            origin: None,
             name: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
             asset_type: "compute.googleapis.com/Instance".into(),
             props: props(i, i % 100), // 100 config variants across the fleet
@@ -71,11 +72,13 @@ fn main() {
         }).unwrap();
         // 2 edges per node: containment + subnet reference
         OpSink::record(&mut pg, Op::ObserveEdge {
+            origin: None,
             src: format!("//crm/projects/p"),
             dst: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
             kind: "CONTAINS".into(), ts: 1_000,
         }).unwrap();
         OpSink::record(&mut pg, Op::ObserveEdge {
+            origin: None,
             src: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
             dst: format!("//compute/subnet-{}", i % 20),
             kind: "REFERENCES".into(), ts: 1_000,
@@ -90,6 +93,7 @@ fn main() {
         let mut p = props(i, i % 100);
         p["status"] = json!("TERMINATED");
         OpSink::record(&mut pg, Op::ObserveNode {
+            origin: None,
             name: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
             asset_type: "compute.googleapis.com/Instance".into(),
             props: p, ts: 2_000,

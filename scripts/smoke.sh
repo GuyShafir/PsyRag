@@ -134,6 +134,31 @@ grep -qi "idempotency-replayed: true" "$WORK/idem.hdr" \
   && ok "retry was served from the replay cache" || no "no replay marker on retry"
 kill $SRV 2>/dev/null; sleep 0.5
 
+echo "== 13. provenance: trust quarantine + purge-by-subject =="
+PWAL="$WORK/prov.wal"; PPORT=$((PORT+2)); PURL="http://127.0.0.1:${PPORT}"
+"$BIN" --wal "$PWAL" serve --addr "127.0.0.1:${PPORT}" --token provsecret >"$WORK/serve-prov.log" 2>&1 &
+PSRV=$!; sleep 1.5
+PH='Authorization: Bearer provsecret'
+curl -s -X POST -H "$PH" "$PURL/ingest" -H 'Content-Type: application/json' -d '{
+  "json":"[{\"name\":\"hub\",\"type\":\"t\",\"edges\":[{\"dst\":\"good\",\"kind\":\"REL\"}]}]",
+  "origin":"user:bob","ts":1000}' >/dev/null
+curl -s -X POST -H "$PH" "$PURL/ingest" -H 'Content-Type: application/json' -d '{
+  "json":"[{\"name\":\"hub\",\"type\":\"t\",\"edges\":[{\"dst\":\"evil-fact\",\"kind\":\"REL\"}]}]",
+  "origin":"user:mallory","ts":1000}' >/dev/null
+BOTH=$(curl -s -X POST -H "$PH" "$PURL/retrieve" -d '{"seeds":["hub"],"adapt":false,"ts":2000}' \
+  | j "sorted(x['node'] for x in d['top'] if x['node']!='hub')")
+[ "$BOTH" = "['evil-fact', 'good']" ] && ok "both origins recalled pre-quarantine" || no "unexpected recall: $BOTH"
+curl -s -X POST -H "$PH" "$PURL/quarantine" -d '{"origin_prefix":"user:mallory","trust":0.0}' >/dev/null
+QUAR=$(curl -s -X POST -H "$PH" "$PURL/retrieve" -d '{"seeds":["hub"],"adapt":false,"ts":2000}' \
+  | j "[x['node'] for x in d['top'] if x['node']=='evil-fact']")
+[ "$QUAR" = "[]" ] && ok "quarantined origin masked from recall" || no "quarantine leak: $QUAR"
+PR=$(curl -s -X POST -H "$PH" "$PURL/purge" -d '{"origin_prefix":"user:mallory"}' | j "d['report']['nodes_dropped']")
+[ "$PR" -ge 1 ] && ok "purge dropped the subject's facts (nodes=$PR)" || no "purge failed"
+grep -q "evil-fact" "$PWAL" && no "purged name still on disk" || ok "purged name gone from the WAL bytes"
+kill $PSRV 2>/dev/null; sleep 0.5
+GOOD=$("$BIN" --wal "$PWAL" retrieve --seed hub --top-k 5 --ts 3000 | j "[x['node'] for x in d['top']]")
+echo "$GOOD" | grep -q "good" && ok "unrelated facts survive purge + restart" || no "collateral loss: $GOOD"
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]
