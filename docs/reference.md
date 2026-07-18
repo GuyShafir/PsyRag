@@ -179,12 +179,15 @@ versioned independently of the on-disk formats; breaking changes bump it.
 
 **Idempotent retries.** Every mutating endpoint accepts an
 `Idempotency-Key` header. A repeated (endpoint, key) within the window
-(process lifetime, 24h, 4096 entries per DB) replays the original response
-byte-identically with `Idempotency-Replayed: true` — an at-least-once retry
-can never double-ingest or double-apply credit. Final outcomes (2xx/4xx) are
-cached; 5xx are not (the retry should reprocess). Concurrent duplicates get
-409. The Python client generates keys automatically and retries with the
-same key. *(Dedup does not yet survive a server restart.)*
+(24h, 4096 entries per DB) replays the original response byte-identically
+with `Idempotency-Replayed: true` — an at-least-once retry can never
+double-ingest or double-apply credit. **Dedup is durable**: final outcomes
+(2xx/4xx) are fsynced to `<sidecar>.idem.jsonl` *before* the response is
+sent, so replay works across server restarts and crashes. 5xx are not
+recorded (the retry should reprocess); concurrent duplicates get 409
+(in-flight markers are memory-only — a marker that died with a crash should
+be retryable). The Python client generates keys automatically and retries
+with the same key.
 
 **Auth.** With `--token`/`--read-token` set, every endpoint except
 `/health`, `/live`, `/ready`, and the UI shell requires

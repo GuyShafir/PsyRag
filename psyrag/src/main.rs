@@ -103,7 +103,14 @@ fn open_engine(a: &Args) -> Result<Engine, String> {
     layer.set_wal_binding(pg.wal_id(), pg.lsn());
     layer.load_if_exists(pg.graph(), &scp)?;
     layer.sync(pg.graph());
-    Ok(Engine { pg, layer, sidecar_path: scp, traces: engine::TraceStore::in_memory(4096), wedged: None })
+    Ok(Engine {
+        pg,
+        layer,
+        sidecar_path: scp,
+        traces: engine::TraceStore::in_memory(4096),
+        idem: engine::IdemStore::in_memory(4096, serve::IDEM_WINDOW_MS),
+        wedged: None,
+    })
 }
 
 fn main() {
