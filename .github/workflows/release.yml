@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p psyrag --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          tar -czf psyrag-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release psyrag
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: psyrag-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          generate_release_notes: false
+          body: "See CHANGELOG.md for details."
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/psyrag:${{ github.ref_name }}
+            ghcr.io/${{ github.repository_owner }}/psyrag:latest
