@@ -177,6 +177,60 @@ grep -q '"event":"request"' "$WORK/serve-ops.log" && ok "json request log emitte
 grep -q '"event":"maintenance"' "$WORK/serve-ops.log" && ok "scheduled maintenance ran" || no "scheduler did not fire"
 kill $OSRV 2>/dev/null; sleep 0.5
 
+echo "== 15. quotas: over-quota ingest sheds, maintenance still works =="
+QWAL="$WORK/quota.wal"; QPORT=$((PORT+4)); QURL="http://127.0.0.1:${QPORT}"
+"$BIN" --wal "$QWAL" serve --addr "127.0.0.1:${QPORT}" --max-db-edges 2 >"$WORK/serve-q.log" 2>&1 &
+QSRV=$!; sleep 1.5
+curl -s -X POST "$QURL/ingest" -H 'Content-Type: application/json' \
+  -d '{"json":"[{\"name\":\"q\",\"type\":\"t\",\"edges\":[{\"dst\":\"e1\",\"kind\":\"R\"},{\"dst\":\"e2\",\"kind\":\"R\"}]}]","ts":1000}' >/dev/null
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$QURL/ingest" -H 'Content-Type: application/json' \
+  -d '{"json":"[{\"name\":\"q\",\"type\":\"t\",\"edges\":[{\"dst\":\"e3\",\"kind\":\"R\"}]}]","ts":2000}')
+[ "$C" = "507" ] && ok "over-quota ingest -> 507" || no "expected 507 got $C"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$QURL/consolidate" -d '{}')
+[ "$C" = "200" ] && ok "maintenance allowed at quota" || no "consolidate blocked at quota ($C)"
+kill $QSRV 2>/dev/null; sleep 0.5
+
+echo "== 16. ENOSPC fault injection (tiny volume) =="
+EVOL=""
+if [ "$(uname)" = "Darwin" ]; then
+  DEV=$(hdiutil attach -nomount ram://4096 2>/dev/null | tr -d ' ')
+  if [ -n "$DEV" ] && diskutil erasevolume HFS+ psyragsmoke "$DEV" >/dev/null 2>&1; then
+    EVOL="/Volumes/psyragsmoke"
+  fi
+elif [ "$(uname)" = "Linux" ] && sudo -n true 2>/dev/null; then
+  EVOL="$WORK/tinyfs"; mkdir -p "$EVOL"
+  sudo -n mount -t tmpfs -o size=2m tmpfs "$EVOL" || EVOL=""
+fi
+if [ -z "$EVOL" ]; then
+  echo "  - skipped (no ramdisk/tmpfs available on this host)"
+else
+  EPORT=$((PORT+5)); EURL="http://127.0.0.1:${EPORT}"
+  "$BIN" --wal "$EVOL/e.wal" serve --addr "127.0.0.1:${EPORT}" >"$WORK/serve-e.log" 2>&1 &
+  ESRV=$!; sleep 1.5
+  BLOB=$(python3 -c "print('z'*65536)")
+  LAST=200
+  for i in $(seq 1 80); do
+    LAST=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$EURL/ingest" -H 'Content-Type: application/json' \
+      -d "{\"json\":\"[{\\\"name\\\":\\\"f$i\\\",\\\"type\\\":\\\"t\\\",\\\"props\\\":{\\\"b\\\":\\\"$BLOB\\\"}}]\",\"ts\":$((5000+i))}")
+    [ "$LAST" != "200" ] && break
+  done
+  [ "$LAST" = "500" ] && ok "disk-full ingest failed clean (500, no partial ack)" || no "expected 500 on ENOSPC, got $LAST"
+  W=$(curl -s "$EURL/dbs" | j "d['dbs'][0].get('wedged') is not None and d['dbs'][0]['wedged'] is not None")
+  [ "$W" = "True" ] && ok "database wedged after WAL write failure" || no "not wedged: $W"
+  C=$(curl -s -o /dev/null -w "%{http_code}" "$EURL/stats")
+  [ "$C" = "200" ] && ok "reads keep serving while wedged" || no "reads failed while wedged ($C)"
+  C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$EURL/ingest" -d '{"json":"[]"}')
+  [ "$C" = "503" ] && ok "writes refused while wedged -> 503" || no "expected 503 got $C"
+  kill $ESRV 2>/dev/null; sleep 0.7
+  # restart on the still-full volume: replay must recover (torn tail tolerated)
+  "$BIN" --wal "$EVOL/e.wal" serve --addr "127.0.0.1:${EPORT}" >"$WORK/serve-e2.log" 2>&1 &
+  ESRV=$!; sleep 1.5
+  C=$(curl -s -o /dev/null -w "%{http_code}" "$EURL/stats")
+  [ "$C" = "200" ] && ok "restart on full volume recovers (replay + torn-tail repair)" || no "restart failed ($C)"
+  kill $ESRV 2>/dev/null; sleep 0.5
+  if [ "$(uname)" = "Darwin" ]; then hdiutil detach "$EVOL" -force >/dev/null 2>&1; else sudo -n umount "$EVOL" 2>/dev/null; fi
+fi
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

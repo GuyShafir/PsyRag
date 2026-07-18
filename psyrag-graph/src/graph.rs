@@ -195,6 +195,10 @@ pub struct TemporalGraph {
     open_edges: HashMap<(NodeId, NodeId, u32), EdgeId>,
     out_adj: Vec<Vec<EdgeId>>,
     in_adj: Vec<Vec<EdgeId>>,
+    /// Running estimate of this graph's heap footprint, maintained on every
+    /// observation (append-only, so it only grows; rebuilt structures start
+    /// fresh). An ESTIMATE for quota/budget decisions, not an exact RSS.
+    approx_bytes: usize,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -242,9 +246,21 @@ impl GraphDiff {
     }
 }
 
+/// Rough per-record overheads for the memory estimate: struct sizes plus
+/// map/adjacency entries, rounded generously.
+const NODE_OVERHEAD: usize = 160; // Node + name_to_id entry + adjacency vecs
+const VERSION_OVERHEAD: usize = 72; // NodeVersion + Box<str> header
+const EDGE_OVERHEAD: usize = 104; // Edge + open_edges entry + 2 adjacency slots
+
 impl TemporalGraph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Estimated heap bytes held by graph structures (names, props, edges,
+    /// adjacency). Sidecar columns are ~33 bytes/edge on top of this.
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes
     }
 
     pub fn node_count(&self) -> usize {
@@ -317,6 +333,7 @@ impl TemporalGraph {
             return id;
         }
         let id = self.nodes.len() as NodeId;
+        self.approx_bytes += NODE_OVERHEAD + name.len() * 2; // node + index key
         self.nodes.push(Node {
             name: name.to_string(),
             type_id,
@@ -371,6 +388,7 @@ impl TemporalGraph {
             }
             open.retired_at = ts;
         }
+        self.approx_bytes += VERSION_OVERHEAD + s.len();
         node.versions.push(NodeVersion {
             observed_at: ts,
             retired_at: T_MAX,
@@ -398,6 +416,7 @@ impl TemporalGraph {
         let type_id = self.types.intern(inferred_type);
         let id = self.ensure_node(name, type_id, true);
         if self.nodes[id as usize].open_version_mut().is_none() {
+            self.approx_bytes += VERSION_OVERHEAD + 4;
             self.nodes[id as usize].versions.push(NodeVersion {
                 observed_at: ts,
                 retired_at: T_MAX,
@@ -456,6 +475,7 @@ impl TemporalGraph {
             return eid;
         }
         let eid = self.edges.len() as EdgeId;
+        self.approx_bytes += EDGE_OVERHEAD;
         self.edges.push(Edge {
             src,
             dst,
