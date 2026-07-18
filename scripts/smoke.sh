@@ -48,7 +48,7 @@ OTH=$(echo "$AFT" | python3 -c "import sys,json;d=json.load(sys.stdin);t={x['nod
 python3 -c "import sys;exit(0 if $DBW>1.5*$OTH else 1)" && ok "used edge dominates (db=$DBW vs sibling=$OTH)" || no "no convergence (db=$DBW sibling=$OTH)"
 
 echo "== 5. durable trace survives restart =="
-kill $SRV 2>/dev/null; sleep 0.5
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 "$BIN" --wal "$WAL" serve --addr "127.0.0.1:${PORT}" >"$WORK/serve2.log" 2>&1 &
 SRV=$!; sleep 1.5
 FB=$(curl -s -X POST "$URL/feedback" -H 'Content-Type: application/json' -d "{\"trace_id\":$TID,\"used\":[\"db\"],\"ts\":30000}")
@@ -64,7 +64,7 @@ SL=$(curl -s -X POST "$URL/sleep" -H 'Content-Type: application/json' -d '{"ts":
 DS=$(echo "$SL" | j "d['downscaled']"); PR=$(echo "$SL" | j "d['protected']")
 [ "$DS" -ge 1 ] && ok "sleep ran (downscaled=$DS, protected=$PR)" || no "sleep did not run"
 
-kill $SRV 2>/dev/null; sleep 0.5
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 
 echo "== 8. multidb: isolation + auth =="
 MPORT=$((PORT+1)); MURL="http://127.0.0.1:${MPORT}"
@@ -89,7 +89,7 @@ C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$RH" "$MURL/db/tenant-b/r
 [ "$C" = "200" ] && ok "read token can retrieve" || no "read token retrieve got $C"
 C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$RH" "$MURL/db/tenant-b/ingest" -d '{"json":"[]"}')
 [ "$C" = "403" ] && ok "read token cannot write -> 403" || no "expected 403 got $C"
-kill $MSRV 2>/dev/null; sleep 0.5
+kill $MSRV 2>/dev/null; wait $MSRV 2>/dev/null
 
 echo "== 9. single-writer lock =="
 "$BIN" --wal "$WAL" serve --addr "127.0.0.1:${PORT}" >"$WORK/serve3.log" 2>&1 &
@@ -97,7 +97,7 @@ SRV=$!; sleep 1.5
 "$BIN" --wal "$WAL" stats >/dev/null 2>&1 \
   && no "CLI opened a WAL held by the server" \
   || ok "CLI refused while server holds the WAL lock"
-kill $SRV 2>/dev/null; sleep 0.5
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 
 echo "== 10. checkpoint: log shrinks, learned salience survives replay =="
 # build up version history so there is something for compaction to drop
@@ -132,7 +132,7 @@ F2=$(curl -sD "$WORK/idem.hdr" -H "$IH" -X POST "$URL/feedback" -H 'Content-Type
 [ "$F1" = "$F2" ] && ok "retry returned the identical response" || no "responses differ: $F1 vs $F2"
 grep -qi "idempotency-replayed: true" "$WORK/idem.hdr" \
   && ok "retry was served from the replay cache" || no "no replay marker on retry"
-kill $SRV 2>/dev/null; sleep 0.5
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 
 echo "== 13. provenance: trust quarantine + purge-by-subject =="
 PWAL="$WORK/prov.wal"; PPORT=$((PORT+2)); PURL="http://127.0.0.1:${PPORT}"
@@ -155,7 +155,7 @@ QUAR=$(curl -s -X POST -H "$PH" "$PURL/retrieve" -d '{"seeds":["hub"],"adapt":fa
 PR=$(curl -s -X POST -H "$PH" "$PURL/purge" -d '{"origin_prefix":"user:mallory"}' | j "d['report']['nodes_dropped']")
 [ "$PR" -ge 1 ] && ok "purge dropped the subject's facts (nodes=$PR)" || no "purge failed"
 grep -q "evil-fact" "$PWAL" && no "purged name still on disk" || ok "purged name gone from the WAL bytes"
-kill $PSRV 2>/dev/null; sleep 0.5
+kill $PSRV 2>/dev/null; wait $PSRV 2>/dev/null
 GOOD=$("$BIN" --wal "$PWAL" retrieve --seed hub --top-k 5 --ts 3000 | j "[x['node'] for x in d['top']]")
 echo "$GOOD" | grep -q "good" && ok "unrelated facts survive purge + restart" || no "collateral loss: $GOOD"
 
@@ -175,7 +175,7 @@ echo "$M" | grep -q "psyrag_db_wal_lsn{db=\"default\"}" \
 sleep 1.5
 grep -q '"event":"request"' "$WORK/serve-ops.log" && ok "json request log emitted" || no "no structured request log"
 grep -q '"event":"maintenance"' "$WORK/serve-ops.log" && ok "scheduled maintenance ran" || no "scheduler did not fire"
-kill $OSRV 2>/dev/null; sleep 0.5
+kill $OSRV 2>/dev/null; wait $OSRV 2>/dev/null
 
 echo "== 15. quotas: over-quota ingest sheds, maintenance still works =="
 QWAL="$WORK/quota.wal"; QPORT=$((PORT+4)); QURL="http://127.0.0.1:${QPORT}"
@@ -188,7 +188,7 @@ C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$QURL/ingest" -H 'Content-Ty
 [ "$C" = "507" ] && ok "over-quota ingest -> 507" || no "expected 507 got $C"
 C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$QURL/consolidate" -d '{}')
 [ "$C" = "200" ] && ok "maintenance allowed at quota" || no "consolidate blocked at quota ($C)"
-kill $QSRV 2>/dev/null; sleep 0.5
+kill $QSRV 2>/dev/null; wait $QSRV 2>/dev/null
 
 echo "== 16. ENOSPC fault injection (tiny volume) =="
 EVOL=""
@@ -221,13 +221,13 @@ else
   [ "$C" = "200" ] && ok "reads keep serving while wedged" || no "reads failed while wedged ($C)"
   C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$EURL/ingest" -d '{"json":"[]"}')
   [ "$C" = "503" ] && ok "writes refused while wedged -> 503" || no "expected 503 got $C"
-  kill $ESRV 2>/dev/null; sleep 0.7
+  kill $ESRV 2>/dev/null; wait $ESRV 2>/dev/null
   # restart on the still-full volume: replay must recover (torn tail tolerated)
   "$BIN" --wal "$EVOL/e.wal" serve --addr "127.0.0.1:${EPORT}" >"$WORK/serve-e2.log" 2>&1 &
   ESRV=$!; sleep 1.5
   C=$(curl -s -o /dev/null -w "%{http_code}" "$EURL/stats")
   [ "$C" = "200" ] && ok "restart on full volume recovers (replay + torn-tail repair)" || no "restart failed ($C)"
-  kill $ESRV 2>/dev/null; sleep 0.5
+  kill $ESRV 2>/dev/null; wait $ESRV 2>/dev/null
   if [ "$(uname)" = "Darwin" ]; then hdiutil detach "$EVOL" -force >/dev/null 2>&1; else sudo -n umount "$EVOL" 2>/dev/null; fi
 fi
 
@@ -240,7 +240,7 @@ curl -s -X POST "$DURL/ingest" -H 'Content-Type: application/json' \
   -d '{"json":"[{\"name\":\"seedn\",\"type\":\"t\",\"edges\":[{\"dst\":\"tgt\",\"kind\":\"R\"}]}]","ts":1000}' >/dev/null
 R1=$(curl -s -H "$DH" -X POST "$DURL/feedback" -H 'Content-Type: application/json' \
   -d '{"seeds":["seedn"],"used":["tgt"],"ts":2000}')
-kill $DSRV 2>/dev/null; sleep 0.7
+kill $DSRV 2>/dev/null; wait $DSRV 2>/dev/null
 "$BIN" --wal "$DWAL" serve --addr "127.0.0.1:${DPORT}" >"$WORK/serve-d2.log" 2>&1 &
 DSRV=$!; sleep 1.5
 R2=$(curl -sD "$WORK/didem.hdr" -H "$DH" -X POST "$DURL/feedback" -H 'Content-Type: application/json' \
@@ -248,7 +248,7 @@ R2=$(curl -sD "$WORK/didem.hdr" -H "$DH" -X POST "$DURL/feedback" -H 'Content-Ty
 [ "$R1" = "$R2" ] && ok "post-restart retry replayed the original response" || no "responses differ across restart"
 grep -qi "idempotency-replayed: true" "$WORK/didem.hdr" \
   && ok "post-restart retry served from the DURABLE replay log" || no "restart lost the dedup record"
-kill $DSRV 2>/dev/null; sleep 0.5
+kill $DSRV 2>/dev/null; wait $DSRV 2>/dev/null
 
 echo "== 18. per-db tokens + poisoning limits =="
 SPORT=$((PORT+7)); SURL="http://127.0.0.1:${SPORT}"
@@ -270,7 +270,7 @@ curl -s -X POST -H "$AT" "$SURL/db/tenant-a/feedback" -d '{"seeds":["own"],"used
 curl -s -X POST -H "$AT" "$SURL/db/tenant-a/feedback" -d '{"seeds":["own"],"used":["x"],"ts":2001}' >/dev/null
 C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$AT" "$SURL/db/tenant-a/feedback" -d '{"seeds":["own"],"used":["x"],"ts":2002}')
 [ "$C" = "429" ] && ok "feedback rate limit -> 429" || no "rate limit missing ($C)"
-kill $SSRV 2>/dev/null; sleep 0.5
+kill $SSRV 2>/dev/null; wait $SSRV 2>/dev/null
 
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
