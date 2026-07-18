@@ -159,6 +159,24 @@ kill $PSRV 2>/dev/null; sleep 0.5
 GOOD=$("$BIN" --wal "$PWAL" retrieve --seed hub --top-k 5 --ts 3000 | j "[x['node'] for x in d['top']]")
 echo "$GOOD" | grep -q "good" && ok "unrelated facts survive purge + restart" || no "collateral loss: $GOOD"
 
+echo "== 14. operability: prometheus, api header, json logs, scheduler =="
+OWAL="$WORK/ops.wal"; OPORT=$((PORT+3)); OURL="http://127.0.0.1:${OPORT}"
+"$BIN" --wal "$OWAL" serve --addr "127.0.0.1:${OPORT}" --log-format json \
+  --consolidate-every 1s >"$WORK/serve-ops.log" 2>&1 &
+OSRV=$!; sleep 1.5
+curl -s -X POST "$OURL/ingest" -H 'Content-Type: application/json' \
+  -d '{"json":"[{\"name\":\"x\",\"type\":\"t\",\"edges\":[{\"dst\":\"y\",\"kind\":\"REL\"}]}]","ts":1000}' >/dev/null
+curl -sI "$OURL/health" | grep -qi "x-psyrag-api: 1" && ok "API version header present" || no "missing X-PsyRag-Api"
+M=$(curl -s "$OURL/metrics")
+echo "$M" | grep -q "psyrag_requests_total{route=\"ingest\",status=\"2xx\"}" \
+  && ok "prometheus request counters" || no "no request counters in /metrics"
+echo "$M" | grep -q "psyrag_db_wal_lsn{db=\"default\"}" \
+  && ok "prometheus per-db gauges" || no "no per-db gauges in /metrics"
+sleep 1.5
+grep -q '"event":"request"' "$WORK/serve-ops.log" && ok "json request log emitted" || no "no structured request log"
+grep -q '"event":"maintenance"' "$WORK/serve-ops.log" && ok "scheduled maintenance ran" || no "scheduler did not fire"
+kill $OSRV 2>/dev/null; sleep 0.5
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

@@ -76,6 +76,22 @@ single-DB clients work unchanged. `--max-open-dbs` caps resident DBs
 (LRU-evicting idle ones); back up a DB by copying its directory (stop the
 server or use a filesystem snapshot).
 
+## Observability
+
+- **Metrics**: point Prometheus at `GET /metrics` (send the read token via
+  `authorization` in the scrape config when auth is on). Alert suggestions:
+  `psyrag_db_wedged > 0` (page — writes are failing), `rate(psyrag_requests_total{status="5xx"}[5m]) > 0`,
+  p99 of `psyrag_request_duration_seconds` per route, and
+  `psyrag_db_wal_lsn` growth without matching checkpoints (log bloat).
+- **Logs**: `--log-format json` emits one object per line on stderr
+  (`request` events with method/path/db/status/ms; `maintenance`,
+  `serve_start/serve_stop`, `open_bind`, `*_failed` events). Ship stderr to
+  your log stack; `text` format keeps `key=value` pairs for humans.
+- **Built-in maintenance**: `--consolidate-every 10m --sleep-every 24h
+  --checkpoint-every 24h` replaces external cron; each task takes the DB
+  write lock, runs, persists, and logs a `maintenance` event (wedged DBs are
+  skipped and logged).
+
 ## Scheduling sleep
 
 `sleep` is an offline batch op, not on the retrieval path. Run it on a schedule:
@@ -156,9 +172,11 @@ Asserts, exiting non-zero on any failure:
 12. **idempotent retry** — a repeated Idempotency-Key returns the identical
     response from the replay cache and never double-applies,
 13. **provenance** — quarantine masks a hostile origin from recall; purge
-    removes its facts from the WAL bytes; unrelated facts survive restart.
+    removes its facts from the WAL bytes; unrelated facts survive restart,
+14. **operability** — Prometheus counters + per-db gauges, API version
+    header, JSON request logs, and the built-in maintenance scheduler.
 
-Expected tail: `==== 23 passed, 0 failed ====`.
+Expected tail: `==== 28 passed, 0 failed ====`.
 
 ### Python / ADK
 ```bash

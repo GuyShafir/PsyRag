@@ -1,4 +1,4 @@
-//! CLI monitoring dashboard. Polls a running `psyrag serve` /metrics endpoint and
+//! CLI monitoring dashboard. Polls a running `psyrag serve` /stats endpoint and
 //! redraws a live terminal view using ANSI escapes only (no TUI dependency).
 
 use crate::metrics::{fetch, Metrics};
@@ -62,7 +62,7 @@ pub fn render_frame(m: &Metrics, tick: u64, history: &[f32]) -> String {
 }
 
 pub fn run(url: &str, interval_ms: u64) -> Result<(), String> {
-    let metrics_url = format!("{}/metrics", url.trim_end_matches('/'));
+    let metrics_url = format!("{}/stats", url.trim_end_matches('/'));
     let mut history: Vec<f32> = Vec::new();
     let mut tick = 0u64;
     let mut out = std::io::stdout();

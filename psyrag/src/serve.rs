@@ -23,6 +23,8 @@ use serde::Deserialize;
 use tiny_http::{Method, Request, Response, Server};
 
 use crate::engine::{now_ms, Engine, TraceStore};
+use crate::log;
+use crate::prom;
 
 /// Self-contained management + visualization UI (served at `/` and `/ui`).
 /// The console talks to the bare routes, i.e. the `default` database.
@@ -53,6 +55,10 @@ pub struct ServeOpts {
     pub max_body: usize,
     pub workers: usize,
     pub max_open_dbs: usize,
+    /// Built-in maintenance intervals (None = operator schedules externally).
+    pub sleep_every: Option<Duration>,
+    pub consolidate_every: Option<Duration>,
+    pub checkpoint_every: Option<Duration>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -136,6 +142,8 @@ struct Db {
 struct Registry {
     opts: ServeOpts,
     dbs: RwLock<HashMap<String, Arc<Db>>>,
+    metrics: prom::RequestMetrics,
+    started: Instant,
 }
 
 pub fn valid_db_name(s: &str) -> bool {
@@ -285,10 +293,10 @@ impl Registry {
         for (name, db) in map.iter() {
             let mut e = db.engine.write().unwrap();
             if let Err(er) = e.pg.flush() {
-                eprintln!("psyrag: shutdown flush of db '{name}' WAL failed: {er}");
+                log::error("shutdown_flush_failed", serde_json::json!({"db": name, "error": er}));
             }
             if let Err(er) = e.save_sidecar() {
-                eprintln!("psyrag: shutdown save of db '{name}' sidecar failed: {er}");
+                log::error("shutdown_sidecar_failed", serde_json::json!({"db": name, "error": er}));
             }
         }
     }
@@ -429,6 +437,8 @@ pub fn run(opts: ServeOpts) -> Result<(), String> {
     let reg = Arc::new(Registry {
         opts,
         dbs: RwLock::new(HashMap::new()),
+        metrics: prom::RequestMetrics::new(),
+        started: Instant::now(),
     });
     // Eager-open the default DB: startup fails loudly on a locked/corrupt
     // WAL instead of surfacing it on the first request.
@@ -439,12 +449,27 @@ pub fn run(opts: ServeOpts) -> Result<(), String> {
 
     let loopback = addr.starts_with("127.") || addr.starts_with("localhost") || addr.starts_with("[::1]");
     if !loopback && reg.opts.token.is_none() && reg.opts.read_token.is_none() {
-        eprintln!("psyrag: WARNING: serving on {addr} without --token — anyone who can reach this port has full read/write access");
+        log::warn("open_bind", serde_json::json!({
+            "addr": addr,
+            "msg": "serving without --token: anyone who can reach this port has full read/write access",
+        }));
     }
-    match &reg.opts.data_dir {
-        Some(root) => eprintln!("psyrag serve on http://{addr}  (data-dir={}, {workers} workers)", root.display()),
-        None => eprintln!("psyrag serve on http://{addr}  (wal={}, {workers} workers)", reg.opts.wal),
-    }
+    log::info("serve_start", serde_json::json!({
+        "addr": addr,
+        "workers": workers,
+        "data_dir": reg.opts.data_dir.as_ref().map(|p| p.display().to_string()),
+        "wal": if reg.opts.data_dir.is_none() { Some(reg.opts.wal.clone()) } else { None },
+        "auth": reg.opts.token.is_some() || reg.opts.read_token.is_some(),
+    }));
+    // Console-friendly one-liner regardless of log format.
+    eprintln!("psyrag serve on http://{addr}");
+
+    // Built-in maintenance: one scheduler thread runs due tasks against
+    // every open, non-wedged database (write lock per db per task).
+    let maintenance = {
+        let reg = reg.clone();
+        std::thread::spawn(move || maintenance_loop(&reg))
+    };
 
     let mut handles = Vec::new();
     for _ in 0..workers {
@@ -468,13 +493,95 @@ pub fn run(opts: ServeOpts) -> Result<(), String> {
     for h in handles {
         let _ = h.join();
     }
-    eprintln!("psyrag: draining complete, flushing databases…");
+    let _ = maintenance.join();
+    log::info("serve_drain", serde_json::json!({}));
     reg.flush_all();
-    eprintln!("psyrag: clean shutdown");
+    log::info("serve_stop", serde_json::json!({"uptime_s": reg.started.elapsed().as_secs()}));
     Ok(())
 }
 
+/// Run scheduled sleep/consolidate/checkpoint against every open database.
+/// Ticks coarsely; a task fires when its interval has elapsed since its last
+/// firing (first firing is one full interval after startup).
+fn maintenance_loop(reg: &Arc<Registry>) {
+    let tasks: Vec<(&str, Duration)> = [
+        ("consolidate", reg.opts.consolidate_every),
+        ("sleep", reg.opts.sleep_every),
+        ("checkpoint", reg.opts.checkpoint_every),
+    ]
+    .into_iter()
+    .filter_map(|(n, d)| d.map(|d| (n, d)))
+    .collect();
+    if tasks.is_empty() {
+        return;
+    }
+    let mut last: HashMap<&str, Instant> = tasks.iter().map(|(n, _)| (*n, Instant::now())).collect();
+    loop {
+        if STOP.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        for (name, every) in &tasks {
+            if last[name].elapsed() < *every {
+                continue;
+            }
+            last.insert(name, Instant::now());
+            let dbs: Vec<(String, Arc<Db>)> = reg
+                .dbs
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (db_name, db) in dbs {
+                let mut guard = db.engine.write().unwrap();
+                let e = &mut *guard;
+                if e.wedged.is_some() {
+                    log::warn("maintenance_skip", serde_json::json!({"db": db_name, "task": name, "reason": "wedged"}));
+                    continue;
+                }
+                let ts = now_ms();
+                let outcome: Result<serde_json::Value, String> = match *name {
+                    "consolidate" => {
+                        let (st, _conflicts) = {
+                            let g = e.pg.graph();
+                            e.layer.consolidate(g, ts)
+                        };
+                        e.save_sidecar().map(|_| serde_json::to_value(st).unwrap_or_default())
+                    }
+                    "sleep" => {
+                        let rep = {
+                            let g = e.pg.graph();
+                            e.layer.sleep(g, ts)
+                        };
+                        e.save_sidecar().map(|_| serde_json::to_value(rep).unwrap_or_default())
+                    }
+                    "checkpoint" => e
+                        .pg
+                        .compact(true)
+                        .and_then(|rep| {
+                            e.save_sidecar()?;
+                            e.traces.clear()?;
+                            Ok(serde_json::to_value(rep).unwrap_or_default())
+                        }),
+                    _ => unreachable!(),
+                };
+                match outcome {
+                    Ok(rep) => log::info("maintenance", serde_json::json!({"db": db_name, "task": name, "report": rep})),
+                    Err(er) => {
+                        if *name == "checkpoint" {
+                            e.wedge(&er);
+                        }
+                        log::error("maintenance_failed", serde_json::json!({"db": db_name, "task": name, "error": er}));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn handle_request(reg: &Arc<Registry>, mut request: Request) {
+    let started = Instant::now();
     let method = request.method().clone();
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
@@ -509,7 +616,23 @@ fn handle_request(reg: &Arc<Registry>, mut request: Request) {
             }
         },
     };
+    let status = resp.status_code().0;
+    let dur = started.elapsed();
+    // Metrics + request log use the db-relative route so /db/{x}/retrieve
+    // and /retrieve share a class (bounded label cardinality).
+    let (db_name, db_route) = split_route(&path);
+    reg.metrics.record(prom::classify(&db_route), status, dur);
+    let resp = resp.with_header(
+        "X-PsyRag-Api: 1".parse::<tiny_http::Header>().unwrap(),
+    );
     let _ = request.respond(resp);
+    log::info("request", serde_json::json!({
+        "method": method.to_string(),
+        "path": path,
+        "db": db_name,
+        "status": status,
+        "ms": (dur.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0,
+    }));
 }
 
 fn read_body(request: &mut Request, max: usize) -> Result<String, Resp> {
@@ -551,6 +674,9 @@ fn route(reg: &Arc<Registry>, scope: Scope, method: &Method, path: &str, body: &
     if path == "/dbs" && *method == Method::Get {
         return list_dbs(reg);
     }
+    if path == "/metrics" && *method == Method::Get {
+        return prometheus_metrics(reg);
+    }
     let (name, db_route) = split_route(path);
 
     // /db/{name} itself: create / drop.
@@ -577,6 +703,34 @@ fn route(reg: &Arc<Registry>, scope: Scope, method: &Method, path: &str, body: &
         Ok(db) => handle_db(reg, &db, scope, method, &db_route, body, idem_key),
         Err((code, msg)) => err(&msg, code),
     }
+}
+
+/// Prometheus exposition: request counters/histograms plus per-database
+/// state gauges sampled at scrape time. Busy databases (write-locked) are
+/// skipped for gauges rather than blocking the scrape.
+fn prometheus_metrics(reg: &Arc<Registry>) -> Resp {
+    let mut out = String::with_capacity(4096);
+    out.push_str("# TYPE psyrag_uptime_seconds gauge\n");
+    out.push_str(&format!("psyrag_uptime_seconds {}\n", reg.started.elapsed().as_secs()));
+    reg.metrics.render(&mut out);
+    let dbs = reg.dbs.read().unwrap();
+    out.push_str(&format!("# TYPE psyrag_open_dbs gauge\npsyrag_open_dbs {}\n", dbs.len()));
+    out.push_str("# TYPE psyrag_db_nodes gauge\n# TYPE psyrag_db_edges_live gauge\n# TYPE psyrag_db_edges_dead gauge\n# TYPE psyrag_db_lambda_scale gauge\n# TYPE psyrag_db_ewma_mass gauge\n# TYPE psyrag_db_traces gauge\n# TYPE psyrag_db_wedged gauge\n# TYPE psyrag_db_wal_lsn gauge\n");
+    for (name, db) in dbs.iter() {
+        let Ok(e) = db.engine.try_read() else { continue };
+        let st = e.layer.stats(e.pg.graph());
+        out.push_str(&format!("psyrag_db_nodes{{db=\"{name}\"}} {}\n", st.nodes));
+        out.push_str(&format!("psyrag_db_edges_live{{db=\"{name}\"}} {}\n", st.edges_live));
+        out.push_str(&format!("psyrag_db_edges_dead{{db=\"{name}\"}} {}\n", st.edges_dead));
+        out.push_str(&format!("psyrag_db_lambda_scale{{db=\"{name}\"}} {}\n", st.lambda_scale));
+        out.push_str(&format!("psyrag_db_ewma_mass{{db=\"{name}\"}} {}\n", st.ewma_mass));
+        out.push_str(&format!("psyrag_db_traces{{db=\"{name}\"}} {}\n", e.traces.len()));
+        out.push_str(&format!("psyrag_db_wedged{{db=\"{name}\"}} {}\n", u8::from(e.wedged.is_some())));
+        out.push_str(&format!("psyrag_db_wal_lsn{{db=\"{name}\"}} {}\n", e.pg.lsn()));
+    }
+    Response::from_string(out)
+        .with_status_code(200)
+        .with_header("Content-Type: text/plain; version=0.0.4; charset=utf-8".parse::<tiny_http::Header>().unwrap())
 }
 
 fn list_dbs(reg: &Arc<Registry>) -> Resp {
@@ -719,7 +873,7 @@ fn handle_db(
             }
         }
         (Method::Get, "/health") => json_resp(&serde_json::json!({"ok": true}), 200),
-        (Method::Get, "/stats") | (Method::Get, "/metrics") => {
+        (Method::Get, "/stats") => {
             let e = db.engine.read().unwrap();
             json_resp(&e.layer.stats(e.pg.graph()), 200)
         }
