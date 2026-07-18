@@ -17,6 +17,8 @@
 //!                [--max-body-mb N] [--max-open-dbs N] [--log-format json|text]
 //!                [--sleep-every D] [--consolidate-every D] [--checkpoint-every D]
 //!                [--max-db-mb N] [--max-db-edges N] [--max-mem-mb N]
+//!                [--db-token NAME=TOKEN ...] [--max-credit R] [--max-feedback-per-min N]
+//!                [--ephemeral-traces]
 //!   psyrag monitor [--url URL] [--interval-ms N]
 //! Global: --wal PATH  --sidecar PATH  --config PATH.json
 //!         --data-dir DIR  --db NAME     (multi-database layout)
@@ -32,9 +34,9 @@ mod prom;
 mod serve;
 
 use args::Args;
-use psyrag_graph::PersistentGraph;
-use psyrag_core::PlasticityLayer;
 use engine::{now_ms, Engine};
+use psyrag_core::PlasticityLayer;
+use psyrag_graph::PersistentGraph;
 use std::path::Path;
 
 const USAGE: &str = "psyrag <command> [flags]
@@ -86,7 +88,9 @@ fn parse_every(s: &str) -> Result<std::time::Duration, String> {
         Some('d') => (&s[..s.len() - 1], 86_400),
         _ => (s, 1),
     };
-    let n: u64 = num.parse().map_err(|_| format!("bad interval '{s}' (want e.g. 90s, 30m, 24h)"))?;
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("bad interval '{s}' (want e.g. 90s, 30m, 24h)"))?;
     if n == 0 {
         return Err(format!("interval '{s}' must be > 0"));
     }
@@ -140,19 +144,26 @@ fn dispatch(a: &Args) -> Result<(), String> {
             let t = a.get_i64("ts").unwrap_or_else(now_ms);
             let stale = if a.has("cai") {
                 #[cfg(feature = "gcp")]
-                { e.pg.ingest_cai_snapshot(&json, t)? }
+                {
+                    e.pg.ingest_cai_snapshot(&json, t)?
+                }
                 #[cfg(not(feature = "gcp"))]
-                { return Err("built without gcp feature".into()); }
+                {
+                    return Err("built without gcp feature".into());
+                }
             } else {
                 e.pg.ingest_entities_from(&json, t, a.has("reconcile"), a.get("origin"))?
             };
             e.layer.sync(e.pg.graph());
             e.save_sidecar()?;
-            println!("{}", serde_json::json!({
-                "edges": e.pg.graph().edge_count(),
-                "nodes": e.pg.graph().node_count(),
-                "stale_retired": stale,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "edges": e.pg.graph().edge_count(),
+                    "nodes": e.pg.graph().node_count(),
+                    "stale_retired": stale,
+                })
+            );
         }
         Some("retrieve") => {
             let seeds = a.get_all("seed");
@@ -192,7 +203,8 @@ fn dispatch(a: &Args) -> Result<(), String> {
                     "uniform" => psyrag_core::Spread::Uniform,
                     _ => psyrag_core::Spread::ByActivation,
                 };
-                e.layer.feedback_reward(e.pg.graph(), &seed_refs, d, f, k, t, reward, spread)
+                e.layer
+                    .feedback_reward(e.pg.graph(), &seed_refs, d, f, k, t, reward, spread)
             } else if a.has("credit") {
                 let mut nodes = Vec::new();
                 for spec in a.get_all("credit") {
@@ -203,12 +215,16 @@ fn dispatch(a: &Args) -> Result<(), String> {
                     let s: f32 = p[1].parse().map_err(|_| "score must be a number")?;
                     nodes.push((p[0].to_string(), s));
                 }
-                let (_r, trace) = e.layer.retrieve_traced(e.pg.graph(), &seed_refs, d, f, k, t);
-                e.layer.apply_credit(e.pg.graph(), &trace, &psyrag_core::Credit::Nodes(nodes), t)
+                let (_r, trace) = e
+                    .layer
+                    .retrieve_traced(e.pg.graph(), &seed_refs, d, f, k, t);
+                e.layer
+                    .apply_credit(e.pg.graph(), &trace, &psyrag_core::Credit::Nodes(nodes), t)
             } else {
                 let used = a.get_all("used");
                 let used_refs: Vec<&str> = used.iter().map(|s| s.as_str()).collect();
-                e.layer.feedback(e.pg.graph(), &seed_refs, d, f, k, t, &used_refs)
+                e.layer
+                    .feedback(e.pg.graph(), &seed_refs, d, f, k, t, &used_refs)
             };
             e.save_sidecar()?;
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -235,7 +251,10 @@ fn dispatch(a: &Args) -> Result<(), String> {
             }
             e.layer.touch(&touches, t);
             e.save_sidecar()?;
-            println!("{}", serde_json::json!({"touched": touches.len(), "missed": missed}));
+            println!(
+                "{}",
+                serde_json::json!({"touched": touches.len(), "missed": missed})
+            );
         }
         Some("consolidate") => {
             let mut e = open_engine(a)?;
@@ -257,13 +276,20 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 e.layer.sync(e.pg.graph());
             }
             e.save_sidecar()?;
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "stats": stats, "conflicts": conflicts, "applied_ops": applied
-            })).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "stats": stats, "conflicts": conflicts, "applied_ops": applied
+                }))
+                .unwrap()
+            );
         }
         Some("stats") => {
             let e = open_engine(a)?;
-            println!("{}", serde_json::to_string_pretty(&e.layer.stats(e.pg.graph())).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&e.layer.stats(e.pg.graph())).unwrap()
+            );
         }
         Some("sleep") => {
             let mut e = open_engine(a)?;
@@ -281,10 +307,13 @@ fn dispatch(a: &Args) -> Result<(), String> {
             let e = open_engine(a)?;
             let t = a.get_i64("ts").unwrap_or_else(now_ms);
             export::export_bq(&e, &out, t, &dataset)?;
-            println!("{}", serde_json::json!({
-                "out": out, "dataset": dataset,
-                "files": ["nodes.jsonl","edges.jsonl","traces.jsonl","schema.sql","queries.gql","load.sh"]
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "out": out, "dataset": dataset,
+                    "files": ["nodes.jsonl","edges.jsonl","traces.jsonl","schema.sql","queries.gql","load.sh"]
+                })
+            );
         }
         Some("purge") => {
             let prefix = a.get("origin").ok_or("--origin PREFIX required")?;
@@ -311,9 +340,13 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 std::fs::write(&trace_log, b"").map_err(|x| x.to_string())?;
                 traces_cleared = true;
             }
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "report": report, "traces_cleared": traces_cleared,
-            })).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "report": report, "traces_cleared": traces_cleared,
+                }))
+                .unwrap()
+            );
         }
         Some("verify") => {
             let (wal, scp, _) = db_paths(a)?;
@@ -346,12 +379,16 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 serde_json::json!({"loadable": null, "note": "no sidecar file"})
             };
             let healthy = rep.corrupt.is_none();
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "wal": rep,
-                "graph": {"nodes": g.node_count(), "edges": g.edge_count()},
-                "sidecar": sidecar_check,
-                "healthy": healthy,
-            })).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "wal": rep,
+                    "graph": {"nodes": g.node_count(), "edges": g.edge_count()},
+                    "sidecar": sidecar_check,
+                    "healthy": healthy,
+                }))
+                .unwrap()
+            );
             if !healthy {
                 return Err("WAL verification failed (mid-file corruption)".into());
             }
@@ -390,7 +427,9 @@ fn dispatch(a: &Args) -> Result<(), String> {
             println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
         }
         Some("db") => {
-            let root = a.get("data-dir").ok_or("db command requires --data-dir DIR")?;
+            let root = a
+                .get("data-dir")
+                .ok_or("db command requires --data-dir DIR")?;
             match a.positionals.get(1).map(|s| s.as_str()) {
                 Some("list") => {
                     let mut rows = Vec::new();
@@ -414,7 +453,10 @@ fn dispatch(a: &Args) -> Result<(), String> {
                         }
                     }
                     rows.sort_by(|x, y| x["db"].as_str().cmp(&y["db"].as_str()));
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({"dbs": rows})).unwrap());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({"dbs": rows})).unwrap()
+                    );
                 }
                 Some("create") => {
                     let name = a
@@ -422,11 +464,16 @@ fn dispatch(a: &Args) -> Result<(), String> {
                         .get(2)
                         .ok_or("usage: psyrag db create NAME --data-dir DIR")?;
                     if !serve::valid_db_name(name) {
-                        return Err(format!("invalid db name '{name}' (want [a-z0-9_-]{{1,64}})"));
+                        return Err(format!(
+                            "invalid db name '{name}' (want [a-z0-9_-]{{1,64}})"
+                        ));
                     }
                     let dir = Path::new(root).join(name);
                     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                    println!("{}", serde_json::json!({"created": name, "dir": dir.display().to_string()}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"created": name, "dir": dir.display().to_string()})
+                    );
                 }
                 _ => return Err("usage: psyrag db {list | create NAME} --data-dir DIR".into()),
             }
@@ -450,7 +497,9 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 a.get(key).map(parse_every).transpose()
             };
             let workers = a.get_usize("workers").unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4)
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(8))
+                    .unwrap_or(4)
             });
             let opts = serve::ServeOpts {
                 addr,
@@ -475,6 +524,22 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 max_db_bytes: a.get_usize("max-db-mb").unwrap_or(0) * 1024 * 1024,
                 max_db_edges: a.get_usize("max-db-edges").unwrap_or(0),
                 max_mem_bytes: a.get_usize("max-mem-mb").unwrap_or(0) * 1024 * 1024,
+                db_tokens: {
+                    let mut m = std::collections::HashMap::new();
+                    for spec in a.get_all("db-token") {
+                        let Some((db, tok)) = spec.split_once('=') else {
+                            return Err(format!("bad --db-token '{spec}', want NAME=TOKEN"));
+                        };
+                        if !serve::valid_db_name(db) {
+                            return Err(format!("bad --db-token db name '{db}'"));
+                        }
+                        m.insert(db.to_string(), tok.to_string());
+                    }
+                    m
+                },
+                max_credit: a.get_f32("max-credit").unwrap_or(100.0),
+                max_feedback_per_min: a.get_u32("max-feedback-per-min").unwrap_or(0),
+                ephemeral_traces: a.has("ephemeral-traces"),
             };
             serve::run(opts)?;
         }

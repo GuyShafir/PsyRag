@@ -28,6 +28,11 @@ curl -s -X POST localhost:8080/ingest -H 'content-type: application/json' \
 open http://localhost:8080/     # the console
 ```
 
+See the **[operations runbook](runbook.md)** for capacity planning, the
+upgrade procedure, backup/restore drills, RPO/RTO, and the HA position.
+Ready-made TLS termination configs ship in [`deploy/`](../deploy/)
+(nginx + Caddy).
+
 ## Security
 
 The server binds `127.0.0.1` by default. To expose it:
@@ -222,9 +227,12 @@ Asserts, exiting non-zero on any failure:
     restart on the still-full volume recovers. Skipped where no ram-disk
     can be created,
 17. **durable idempotency** — an Idempotency-Key retry AFTER a server
-    restart still replays the original response from the fsynced log.
+    restart still replays the original response from the fsynced log,
+18. **per-db tokens + poisoning limits** — a db-scoped token works in its
+    own database, gets 403 elsewhere and on server admin; the feedback
+    rate limit returns 429.
 
-Expected tail: `==== 32 passed, 0 failed ====` (37 with the ENOSPC section).
+Expected tail: `==== 36 passed, 0 failed ====` (41 with the ENOSPC section).
 
 ### Python / ADK
 ```bash

@@ -130,7 +130,9 @@ pub fn asset_ops(asset: &CaiAsset, ts: Ts) -> (Vec<Op>, Vec<String>) {
     // 1. Containment chain. CAI ancestors are ordered leaf -> root.
     let mut child = asset.name.clone();
     for anc in &asset.ancestors {
-        let Some((anc_name, anc_type)) = crm_node(anc) else { continue };
+        let Some((anc_name, anc_type)) = crm_node(anc) else {
+            continue;
+        };
         if anc_name == asset.name {
             continue; // a project's own CAI record lists itself first
         }

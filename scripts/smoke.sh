@@ -250,6 +250,28 @@ grep -qi "idempotency-replayed: true" "$WORK/didem.hdr" \
   && ok "post-restart retry served from the DURABLE replay log" || no "restart lost the dedup record"
 kill $DSRV 2>/dev/null; sleep 0.5
 
+echo "== 18. per-db tokens + poisoning limits =="
+SPORT=$((PORT+7)); SURL="http://127.0.0.1:${SPORT}"
+"$BIN" --data-dir "$WORK/scoped" serve --addr "127.0.0.1:${SPORT}" \
+  --token rootsecret --db-token tenant-a=akey --max-feedback-per-min 2 >"$WORK/serve-s.log" 2>&1 &
+SSRV=$!; sleep 1.5
+RT='Authorization: Bearer rootsecret'; AT='Authorization: Bearer akey'
+curl -s -X POST -H "$RT" "$SURL/db/tenant-a" >/dev/null
+curl -s -X POST -H "$RT" "$SURL/db/tenant-b" >/dev/null
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$AT" "$SURL/db/tenant-a/ingest" \
+  -H 'Content-Type: application/json' \
+  -d '{"json":"[{\"name\":\"own\",\"type\":\"t\",\"edges\":[{\"dst\":\"x\",\"kind\":\"R\"}]}]","ts":1000}')
+[ "$C" = "200" ] && ok "db token writes its own db" || no "db token blocked on own db ($C)"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$AT" "$SURL/db/tenant-b/retrieve" -d '{"seeds":["own"],"adapt":false}')
+[ "$C" = "403" ] && ok "db token denied on another db -> 403" || no "cross-db leak ($C)"
+C=$(curl -s -o /dev/null -w "%{http_code}" -H "$AT" "$SURL/dbs")
+[ "$C" = "403" ] && ok "db token denied server admin -> 403" || no "admin leak ($C)"
+curl -s -X POST -H "$AT" "$SURL/db/tenant-a/feedback" -d '{"seeds":["own"],"used":["x"],"ts":2000}' >/dev/null
+curl -s -X POST -H "$AT" "$SURL/db/tenant-a/feedback" -d '{"seeds":["own"],"used":["x"],"ts":2001}' >/dev/null
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$AT" "$SURL/db/tenant-a/feedback" -d '{"seeds":["own"],"used":["x"],"ts":2002}')
+[ "$C" = "429" ] && ok "feedback rate limit -> 429" || no "rate limit missing ($C)"
+kill $SSRV 2>/dev/null; sleep 0.5
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

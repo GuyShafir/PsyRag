@@ -146,6 +146,10 @@ Run the HTTP server with the web console at `/`.
 | `--max-db-mb N` | ∞ | per-DB size quota (estimate); at quota, `/ingest` → 507 while maintenance/feedback still work |
 | `--max-db-edges N` | ∞ | per-DB edge-count quota, same semantics |
 | `--max-mem-mb N` | ∞ | server memory budget over all open DBs; over budget idle DBs are evicted, then `/ingest` sheds with 429 |
+| `--db-token NAME=TOKEN` | — | repeatable: full-access token **scoped to one database** (server admin + other DBs → 403) |
+| `--max-credit R` | 100 | server-side clamp on feedback \|reward\|/\|score\| (0 = off) |
+| `--max-feedback-per-min N` | ∞ | per-DB `/feedback` rate limit → 429 |
+| `--ephemeral-traces` | off | keep retrieval traces in memory only (no trace data on disk; deferred credit does not survive restarts) |
 | `--log-format F` | `text` | `json` for structured one-object-per-line logs on stderr |
 | `--sleep-every D` | — | run sleep on every open DB each interval (`90s`/`30m`/`24h`) |
 | `--consolidate-every D` | — | run consolidation each interval |
@@ -189,7 +193,10 @@ recorded (the retry should reprocess); concurrent duplicates get 409
 be retryable). The Python client generates keys automatically and retries
 with the same key.
 
-**Auth.** With `--token`/`--read-token` set, every endpoint except
+**Auth.** Tokens come in three scopes: `--token` (full, all databases),
+`--read-token` (read-only, all databases), and repeatable
+`--db-token NAME=TOKEN` (full, but confined to `/db/NAME/...` — server-level
+routes and other databases return 403). With any token set, every endpoint except
 `/health`, `/live`, `/ready`, and the UI shell requires
 `Authorization: Bearer <token>`. The read token may hit GET endpoints,
 `POST /match`, and `POST /retrieve` only with `"adapt": false, "trace": false`

@@ -32,8 +32,14 @@ multi-tenant store.
 ## Tiered: PsyRag as a layer over long-term storage
 
 To scale beyond one process — and to make the store a managed GCP service —
-PsyRag becomes a **compute layer over a pluggable backend**. The governing rule,
-learned from graph-traversal-over-a-database experience:
+PsyRag becomes a **compute layer over a pluggable backend**. The seam is
+**real code**: `psyrag_core::backend::GraphBackend`, with `InMemoryBackend`
+as the reference implementation and a conformance test suite
+(`psyrag-core/tests/backend_conformance.rs`) that any managed implementation
+must pass. Managed backends (Spanner, AlloyDB) are roadmap — implementing
+one means taking client-library dependencies, a deliberate departure from
+the zero-dep core. The governing rule, learned from
+graph-traversal-over-a-database experience:
 
 > **The backend boundary is per-query / per-cycle, never per-edge.**
 

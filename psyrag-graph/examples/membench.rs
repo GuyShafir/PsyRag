@@ -24,7 +24,12 @@ fn rss_mb() -> f64 {
 /// near-identical config differing only in name/IP.
 fn props(node: usize, variant: usize) -> serde_json::Value {
     let env = ["prod", "staging", "dev"][variant % 3];
-    let mt = ["e2-standard-2","e2-standard-4","e2-standard-8","e2-standard-16"][variant % 4];
+    let mt = [
+        "e2-standard-2",
+        "e2-standard-4",
+        "e2-standard-8",
+        "e2-standard-16",
+    ][variant % 4];
     json!({
         "name": format!("resource-{node}"),
         "selfLink": format!("https://www.googleapis.com/compute/v1/projects/p/zones/z/instances/resource-{node}"),
@@ -63,26 +68,40 @@ fn main() {
     // Snapshot 1
     let t = Instant::now();
     for i in 0..N {
-        OpSink::record(&mut pg, Op::ObserveNode {
-            origin: None,
-            name: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
-            asset_type: "compute.googleapis.com/Instance".into(),
-            props: props(i, i % 100), // 100 config variants across the fleet
-            ts: 1_000,
-        }).unwrap();
+        OpSink::record(
+            &mut pg,
+            Op::ObserveNode {
+                origin: None,
+                name: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
+                asset_type: "compute.googleapis.com/Instance".into(),
+                props: props(i, i % 100), // 100 config variants across the fleet
+                ts: 1_000,
+            },
+        )
+        .unwrap();
         // 2 edges per node: containment + subnet reference
-        OpSink::record(&mut pg, Op::ObserveEdge {
-            origin: None,
-            src: format!("//crm/projects/p"),
-            dst: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
-            kind: "CONTAINS".into(), ts: 1_000,
-        }).unwrap();
-        OpSink::record(&mut pg, Op::ObserveEdge {
-            origin: None,
-            src: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
-            dst: format!("//compute/subnet-{}", i % 20),
-            kind: "REFERENCES".into(), ts: 1_000,
-        }).unwrap();
+        OpSink::record(
+            &mut pg,
+            Op::ObserveEdge {
+                origin: None,
+                src: format!("//crm/projects/p"),
+                dst: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
+                kind: "CONTAINS".into(),
+                ts: 1_000,
+            },
+        )
+        .unwrap();
+        OpSink::record(
+            &mut pg,
+            Op::ObserveEdge {
+                origin: None,
+                src: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
+                dst: format!("//compute/subnet-{}", i % 20),
+                kind: "REFERENCES".into(),
+                ts: 1_000,
+            },
+        )
+        .unwrap();
     }
     pg.flush().unwrap();
     let ingest1 = t.elapsed();
@@ -92,12 +111,17 @@ fn main() {
     for i in (0..N).step_by(50) {
         let mut p = props(i, i % 100);
         p["status"] = json!("TERMINATED");
-        OpSink::record(&mut pg, Op::ObserveNode {
-            origin: None,
-            name: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
-            asset_type: "compute.googleapis.com/Instance".into(),
-            props: p, ts: 2_000,
-        }).unwrap();
+        OpSink::record(
+            &mut pg,
+            Op::ObserveNode {
+                origin: None,
+                name: format!("//compute.googleapis.com/projects/p/zones/z/instances/i{i}"),
+                asset_type: "compute.googleapis.com/Instance".into(),
+                props: p,
+                ts: 2_000,
+            },
+        )
+        .unwrap();
     }
     pg.flush().unwrap();
     let drift = t.elapsed();
@@ -111,19 +135,43 @@ fn main() {
     let diff_ms = t.elapsed().as_millis();
 
     let t = Instant::now();
-    let br = pg.graph().blast_radius("//compute/subnet-0", 2_001, psyrag_graph::Direction::Up, 3);
+    let br = pg
+        .graph()
+        .blast_radius("//compute/subnet-0", 2_001, psyrag_graph::Direction::Up, 3);
     let br_us = t.elapsed().as_micros();
 
-    println!("nodes={} edges={} versions~{}", pg.graph().node_count(), pg.graph().edge_count(), N + N/50);
-    println!("RSS delta: {:.0} MB ({:.1} KB/asset)", mem, mem * 1024.0 / N as f64);
+    println!(
+        "nodes={} edges={} versions~{}",
+        pg.graph().node_count(),
+        pg.graph().edge_count(),
+        N + N / 50
+    );
+    println!(
+        "RSS delta: {:.0} MB ({:.1} KB/asset)",
+        mem,
+        mem * 1024.0 / N as f64
+    );
     println!("WAL on disk: {:.0} MB", wal_size);
-    println!("ingest snapshot1: {:.1}s | drift pass: {:.2}s", ingest1.as_secs_f64(), drift.as_secs_f64());
-    println!("diff: {}ms | blast radius ({} hits): {}us", diff_ms, br.len(), br_us);
+    println!(
+        "ingest snapshot1: {:.1}s | drift pass: {:.2}s",
+        ingest1.as_secs_f64(),
+        drift.as_secs_f64()
+    );
+    println!(
+        "diff: {}ms | blast radius ({} hits): {}us",
+        diff_ms,
+        br.len(),
+        br_us
+    );
     drop(pg);
 
     // Replay cost (the compaction question)
     let t = Instant::now();
     let pg2 = PersistentGraph::open(wal_path).unwrap();
-    println!("WAL replay ({} nodes): {:.1}s", pg2.graph().node_count(), t.elapsed().as_secs_f64());
+    println!(
+        "WAL replay ({} nodes): {:.1}s",
+        pg2.graph().node_count(),
+        t.elapsed().as_secs_f64()
+    );
     let _ = std::fs::remove_file(wal_path);
 }

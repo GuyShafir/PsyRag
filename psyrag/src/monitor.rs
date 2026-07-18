@@ -11,7 +11,11 @@ fn bar(v: f32, max: f32, width: usize) -> String {
     } else {
         0
     };
-    format!("{}{}", "#".repeat(filled), "-".repeat(width.saturating_sub(filled)))
+    format!(
+        "{}{}",
+        "#".repeat(filled),
+        "-".repeat(width.saturating_sub(filled))
+    )
 }
 
 fn sparkline(vals: &[f32], width: usize) -> String {
@@ -47,14 +51,38 @@ pub fn render_frame(m: &Metrics, tick: u64, history: &[f32]) -> String {
     s.push_str("+-- psyrag-graph-plasticity monitor -----------------------------+\n");
     s.push_str(&format!("| tick {:<54}|\n", tick));
     s.push_str("+--------------------------------------------------------------+\n");
-    s.push_str(&format!("| mass {:>8.4}  setpoint {:>6.3}  err {:>+8.4}         |\n", m.ewma_mass, m.setpoint, err));
-    s.push_str(&format!("|   mass    [{}] {:>6.3}   |\n", bar(m.ewma_mass, (m.setpoint * 2.0).max(0.1), 20), m.ewma_mass));
-    s.push_str(&format!("| lambda_scale {:>6.3}  integral {:>+10.2}            |\n", m.lambda_scale, m.integral));
-    s.push_str(&format!("|   l-scale [{}] {:>6.3}   |\n", bar(m.lambda_scale, 8.0, 20), m.lambda_scale));
+    s.push_str(&format!(
+        "| mass {:>8.4}  setpoint {:>6.3}  err {:>+8.4}         |\n",
+        m.ewma_mass, m.setpoint, err
+    ));
+    s.push_str(&format!(
+        "|   mass    [{}] {:>6.3}   |\n",
+        bar(m.ewma_mass, (m.setpoint * 2.0).max(0.1), 20),
+        m.ewma_mass
+    ));
+    s.push_str(&format!(
+        "| lambda_scale {:>6.3}  integral {:>+10.2}            |\n",
+        m.lambda_scale, m.integral
+    ));
+    s.push_str(&format!(
+        "|   l-scale [{}] {:>6.3}   |\n",
+        bar(m.lambda_scale, 8.0, 20),
+        m.lambda_scale
+    ));
     s.push_str("+--------------------------------------------------------------+\n");
-    s.push_str(&format!("| edges total {:>8} live {:>8} dead {:>8}      |\n", m.edges_total, m.edges_live, m.edges_dead));
-    s.push_str(&format!("|   live    [{}] {:>5.1}%   |\n", bar(live_frac, 1.0, 20), live_frac * 100.0));
-    s.push_str(&format!("| w min {:>6.3} mean {:>6.3} max {:>6.3} nodes {:>7}  |\n", m.weight_min, m.weight_mean, m.weight_max, m.nodes));
+    s.push_str(&format!(
+        "| edges total {:>8} live {:>8} dead {:>8}      |\n",
+        m.edges_total, m.edges_live, m.edges_dead
+    ));
+    s.push_str(&format!(
+        "|   live    [{}] {:>5.1}%   |\n",
+        bar(live_frac, 1.0, 20),
+        live_frac * 100.0
+    ));
+    s.push_str(&format!(
+        "| w min {:>6.3} mean {:>6.3} max {:>6.3} nodes {:>7}  |\n",
+        m.weight_min, m.weight_mean, m.weight_max, m.nodes
+    ));
     s.push_str("+--------------------------------------------------------------+\n");
     s.push_str(&format!("| mass trend {:<50}|\n", sparkline(history, 50)));
     s.push_str("+--------------------------------------------------------------+\n");
@@ -93,9 +121,17 @@ mod tests {
     #[test]
     fn frame_renders() {
         let m = Metrics {
-            edges_total: 100, edges_live: 90, edges_dead: 10, nodes: 40,
-            lambda_scale: 1.2, setpoint: 0.5, ewma_mass: 0.48, integral: 12.3,
-            weight_min: 0.01, weight_max: 0.9, weight_mean: 0.3,
+            edges_total: 100,
+            edges_live: 90,
+            edges_dead: 10,
+            nodes: 40,
+            lambda_scale: 1.2,
+            setpoint: 0.5,
+            ewma_mass: 0.48,
+            integral: 12.3,
+            weight_min: 0.01,
+            weight_max: 0.9,
+            weight_mean: 0.3,
         };
         let f = render_frame(&m, 7, &[0.1, 0.2, 0.3, 0.48]);
         assert!(f.contains("monitor"));

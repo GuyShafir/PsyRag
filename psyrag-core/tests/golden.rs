@@ -35,7 +35,13 @@ fn corpus() -> TemporalGraph {
     g
 }
 
-fn top_names(layer: &PlasticityLayer, g: &TemporalGraph, seeds: &[&str], k: usize, t: i64) -> Vec<String> {
+fn top_names(
+    layer: &PlasticityLayer,
+    g: &TemporalGraph,
+    seeds: &[&str],
+    k: usize,
+    t: i64,
+) -> Vec<String> {
     layer
         .retrieve(g, seeds, 2, 0.9, k, t)
         .top
