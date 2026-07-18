@@ -52,6 +52,9 @@ pub struct ServeOpts {
     pub token: Option<String>,
     /// Bearer token restricted to read endpoints.
     pub read_token: Option<String>,
+    /// Per-database bearer tokens: full access, but ONLY to that database's
+    /// routes (server-level admin denied). db name -> token.
+    pub db_tokens: HashMap<String, String>,
     pub max_body: usize,
     pub workers: usize,
     pub max_open_dbs: usize,
@@ -67,12 +70,29 @@ pub struct ServeOpts {
     /// Server-wide memory budget over all open DBs (0 = unlimited). Over
     /// budget: idle DBs are evicted; if still over, /ingest sheds with 429.
     pub max_mem_bytes: usize,
+    /// Server-side bound on feedback credit magnitudes (|reward| and
+    /// per-node |score| are clamped to this; 0 disables). Guards learned
+    /// weights against one hostile/buggy client, on top of the layer's
+    /// per-edge r_clip.
+    pub max_credit: f32,
+    /// Per-database /feedback rate limit per minute (0 = off) -> 429.
+    pub max_feedback_per_min: u32,
+    /// Keep retrieval traces in memory only (nothing trace-derived touches
+    /// disk; deferred credit then does not survive restarts).
+    pub ephemeral_traces: bool,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Scope {
     Full,
     Read,
+    /// Full access, restricted to one named database.
+    Db(String),
+}
+impl Scope {
+    fn can_write(&self) -> bool {
+        !matches!(self, Scope::Read)
+    }
 }
 
 /// A JSON response as (status, bytes) — kept in this form so idempotent
@@ -123,6 +143,8 @@ struct Db {
     /// In-flight idempotency keys (memory-only: an in-flight marker that
     /// died with a crash SHOULD be retryable).
     inflight: Mutex<HashMap<String, Instant>>,
+    /// Sliding-minute /feedback counter for the rate limit.
+    feedback_window: Mutex<(Instant, u32)>,
     /// Where this DB's config.json lives (multi-DB mode) — quarantine
     /// updates persist there so trust survives restarts.
     cfg_path: Option<PathBuf>,
@@ -142,14 +164,23 @@ pub fn valid_db_name(s: &str) -> bool {
             .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
-fn open_engine_at(wal: &str, sidecar: &str, cfg: Config) -> Result<Engine, String> {
+fn open_engine_at(
+    wal: &str,
+    sidecar: &str,
+    cfg: Config,
+    ephemeral_traces: bool,
+) -> Result<Engine, String> {
     let pg = PersistentGraph::open(wal)?;
     let mut layer = PlasticityLayer::new(cfg);
     // Bind BEFORE load so a sidecar from a different WAL is refused loudly.
     layer.set_wal_binding(pg.wal_id(), pg.lsn());
     layer.load_if_exists(pg.graph(), sidecar)?;
     layer.sync(pg.graph());
-    let traces = TraceStore::open(4096, &format!("{sidecar}.traces.jsonl"));
+    let traces = if ephemeral_traces {
+        TraceStore::in_memory(4096)
+    } else {
+        TraceStore::open(4096, &format!("{sidecar}.traces.jsonl"))
+    };
     let idem =
         crate::engine::IdemStore::open(IDEM_CAP, IDEM_WINDOW_MS, &format!("{sidecar}.idem.jsonl"));
     Ok(Engine {
@@ -251,11 +282,13 @@ impl Registry {
                 }
             }
         }
-        let engine = open_engine_at(&wal, &sidecar, cfg).map_err(|e| (503, e))?;
+        let engine = open_engine_at(&wal, &sidecar, cfg, self.opts.ephemeral_traces)
+            .map_err(|e| (503, e))?;
         let db = Arc::new(Db {
             engine: RwLock::new(engine),
             last_used: Mutex::new(Instant::now()),
             inflight: Mutex::new(HashMap::new()),
+            feedback_window: Mutex::new((Instant::now(), 0)),
             cfg_path,
         });
         map.insert(name.to_string(), db.clone());
@@ -264,7 +297,10 @@ impl Registry {
 
     /// Authenticate a request. Open mode (no tokens configured) grants Full.
     fn auth(&self, req: &Request) -> Result<Scope, Resp> {
-        if self.opts.token.is_none() && self.opts.read_token.is_none() {
+        if self.opts.token.is_none()
+            && self.opts.read_token.is_none()
+            && self.opts.db_tokens.is_empty()
+        {
             return Ok(Scope::Full);
         }
         let presented = req
@@ -291,6 +327,11 @@ impl Registry {
             .is_some_and(|t| ct_eq(t, &presented))
         {
             return Ok(Scope::Read);
+        }
+        for (db, tok) in &self.opts.db_tokens {
+            if ct_eq(tok, &presented) {
+                return Ok(Scope::Db(db.clone()));
+            }
         }
         Err(err("invalid token", 401))
     }
@@ -769,14 +810,30 @@ fn route(
     body: &str,
     idem_key: Option<&str>,
 ) -> Resp {
-    // Server-level admin routes.
+    // Server-level admin routes (denied to db-scoped tokens).
     if path == "/dbs" && *method == Method::Get {
+        if matches!(scope, Scope::Db(_)) {
+            return err("this token is database-scoped", 403);
+        }
         return list_dbs(reg);
     }
     if path == "/metrics" && *method == Method::Get {
+        if matches!(scope, Scope::Db(_)) {
+            return err("this token is database-scoped", 403);
+        }
         return prometheus_metrics(reg);
     }
     let (name, db_route) = split_route(path);
+    // A db-scoped token is confined to its own database's routes; the
+    // server-level surface (/dbs, /metrics, db create/drop) is denied.
+    if let Scope::Db(allowed) = &scope {
+        if *allowed != name || db_route.is_empty() {
+            return err(
+                &format!("this token is scoped to database '{allowed}'"),
+                403,
+            );
+        }
+    }
 
     // /db/{name} itself: create / drop.
     if db_route.is_empty() {
@@ -1204,7 +1261,7 @@ fn handle_db(
         }
         _ => {
             // Everything below mutates the database.
-            if scope != Scope::Full {
+            if !scope.can_write() {
                 return err("write scope required", 403);
             }
             // A wedged database (WAL write failed after in-memory apply)
@@ -1363,10 +1420,40 @@ fn handle_db_write(
             )
         }
         (Method::Post, "/feedback") => {
-            let r: FeedbackReq = match serde_json::from_str(body) {
+            let mut r: FeedbackReq = match serde_json::from_str(body) {
                 Ok(r) => r,
                 Err(e) => return jerr(&format!("bad body: {e}"), 400),
             };
+            // Poisoning limits: per-DB rate window, then server-side clamp
+            // on credit magnitudes (defense in depth above the layer's
+            // per-edge r_clip — one hostile client cannot firehose salience).
+            if reg.opts.max_feedback_per_min > 0 {
+                let mut w = db.feedback_window.lock().unwrap();
+                if w.0.elapsed() >= Duration::from_secs(60) {
+                    *w = (Instant::now(), 0);
+                }
+                w.1 += 1;
+                if w.1 > reg.opts.max_feedback_per_min {
+                    return jerr(
+                        &format!(
+                            "feedback rate limit ({}/min) exceeded",
+                            reg.opts.max_feedback_per_min
+                        ),
+                        429,
+                    );
+                }
+            }
+            let cap = reg.opts.max_credit;
+            if cap > 0.0 {
+                if let Some(rw) = r.reward.as_mut() {
+                    *rw = rw.clamp(-cap, cap);
+                }
+                if let Some(nodes) = r.nodes.as_mut() {
+                    for (_, score) in nodes.iter_mut() {
+                        *score = score.clamp(-cap, cap);
+                    }
+                }
+            }
             let ts = r.ts.unwrap_or_else(now_ms);
             let mut guard = db.engine.write().unwrap();
             let e = &mut *guard;

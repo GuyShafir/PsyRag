@@ -17,6 +17,8 @@
 //!                [--max-body-mb N] [--max-open-dbs N] [--log-format json|text]
 //!                [--sleep-every D] [--consolidate-every D] [--checkpoint-every D]
 //!                [--max-db-mb N] [--max-db-edges N] [--max-mem-mb N]
+//!                [--db-token NAME=TOKEN ...] [--max-credit R] [--max-feedback-per-min N]
+//!                [--ephemeral-traces]
 //!   psyrag monitor [--url URL] [--interval-ms N]
 //! Global: --wal PATH  --sidecar PATH  --config PATH.json
 //!         --data-dir DIR  --db NAME     (multi-database layout)
@@ -522,6 +524,22 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 max_db_bytes: a.get_usize("max-db-mb").unwrap_or(0) * 1024 * 1024,
                 max_db_edges: a.get_usize("max-db-edges").unwrap_or(0),
                 max_mem_bytes: a.get_usize("max-mem-mb").unwrap_or(0) * 1024 * 1024,
+                db_tokens: {
+                    let mut m = std::collections::HashMap::new();
+                    for spec in a.get_all("db-token") {
+                        let Some((db, tok)) = spec.split_once('=') else {
+                            return Err(format!("bad --db-token '{spec}', want NAME=TOKEN"));
+                        };
+                        if !serve::valid_db_name(db) {
+                            return Err(format!("bad --db-token db name '{db}'"));
+                        }
+                        m.insert(db.to_string(), tok.to_string());
+                    }
+                    m
+                },
+                max_credit: a.get_f32("max-credit").unwrap_or(100.0),
+                max_feedback_per_min: a.get_u32("max-feedback-per-min").unwrap_or(0),
+                ephemeral_traces: a.has("ephemeral-traces"),
             };
             serve::run(opts)?;
         }

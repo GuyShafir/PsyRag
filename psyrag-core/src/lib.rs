@@ -30,6 +30,8 @@
 //! `alive_at` filtering, the WAL. Weighted spreading activation reads the graph's
 //! adjacency (`out_edge_ids`) and the sidecar's weights.
 
+pub mod backend;
+
 use psyrag_graph::graph::{EdgeId, NodeId, Ts, T_MAX};
 use psyrag_graph::{Op, TemporalGraph};
 use serde::{Deserialize, Serialize};
