@@ -92,6 +92,17 @@ server or use a filesystem snapshot).
   write lock, runs, persists, and logs a `maintenance` event (wedged DBs are
   skipped and logged).
 
+## Capacity & failure containment
+
+- **Quotas**: `--max-db-mb` / `--max-db-edges` bound each database;
+  `--max-mem-mb` bounds the server (evicts idle DBs under pressure, then
+  sheds ingest with 429). Watch `psyrag_db_approx_bytes` growth against
+  quota and schedule checkpoints before hitting it.
+- **Disk-full is fail-clean**: a WAL write failure wedges the database
+  read-only (503 writes, 200 reads, `psyrag_db_wedged` = 1); restarting
+  after freeing space replays exactly what was acked (the torn record is
+  repaired). Exercised for real in smoke §16 on a 2 MB ram-disk.
+
 ## Scheduling sleep
 
 `sleep` is an offline batch op, not on the retrieval path. Run it on a schedule:
@@ -174,9 +185,14 @@ Asserts, exiting non-zero on any failure:
 13. **provenance** — quarantine masks a hostile origin from recall; purge
     removes its facts from the WAL bytes; unrelated facts survive restart,
 14. **operability** — Prometheus counters + per-db gauges, API version
-    header, JSON request logs, and the built-in maintenance scheduler.
+    header, JSON request logs, and the built-in maintenance scheduler,
+15. **quotas** — over-quota ingest → 507 while maintenance still works,
+16. **ENOSPC fault injection** — on a tiny ram-disk/tmpfs: disk-full ingest
+    fails clean, the DB wedges (reads keep serving, writes 503), and a
+    restart on the still-full volume recovers. Skipped where no ram-disk
+    can be created.
 
-Expected tail: `==== 28 passed, 0 failed ====`.
+Expected tail: `==== 30 passed, 0 failed ====` (34 with the ENOSPC section).
 
 ### Python / ADK
 ```bash

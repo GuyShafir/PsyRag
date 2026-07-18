@@ -143,6 +143,9 @@ Run the HTTP server with the web console at `/`.
 | `--workers N` | `min(cores, 8)` | request worker threads |
 | `--max-body-mb N` | 32 | request body cap (oversize → 413) |
 | `--max-open-dbs N` | 64 | concurrently open databases (LRU-evicts idle ones) |
+| `--max-db-mb N` | ∞ | per-DB size quota (estimate); at quota, `/ingest` → 507 while maintenance/feedback still work |
+| `--max-db-edges N` | ∞ | per-DB edge-count quota, same semantics |
+| `--max-mem-mb N` | ∞ | server memory budget over all open DBs; over budget idle DBs are evicted, then `/ingest` sheds with 429 |
 | `--log-format F` | `text` | `json` for structured one-object-per-line logs on stderr |
 | `--sleep-every D` | — | run sleep on every open DB each interval (`90s`/`30m`/`24h`) |
 | `--consolidate-every D` | — | run consolidation each interval |
@@ -164,6 +167,12 @@ of them with `/db/{name}` to address another database (multi-DB mode):
 `POST /db/tenant-a/retrieve`, `GET /db/tenant-a/stats`, … Databases are fully
 isolated — separate WAL, sidecar, traces, config, and locks; one DB's ingest
 never blocks another DB's retrieval.
+
+**Capacity.** Growth quotas gate `/ingest` only — consolidate, checkpoint,
+purge, sleep, and feedback always work on a full database, so there is
+always a way back under quota. Sizes are the server's own structural
+estimate (`approx_bytes` in `GET /dbs` and `psyrag_db_approx_bytes` in
+metrics), not RSS.
 
 **API version.** Every response carries `X-PsyRag-Api: 1`. The wire API is
 versioned independently of the on-disk formats; breaking changes bump it.

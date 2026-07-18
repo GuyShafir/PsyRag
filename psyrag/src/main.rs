@@ -16,6 +16,7 @@
 //!   psyrag serve [--addr HOST:PORT] [--token T] [--read-token T] [--workers N]
 //!                [--max-body-mb N] [--max-open-dbs N] [--log-format json|text]
 //!                [--sleep-every D] [--consolidate-every D] [--checkpoint-every D]
+//!                [--max-db-mb N] [--max-db-edges N] [--max-mem-mb N]
 //!   psyrag monitor [--url URL] [--interval-ms N]
 //! Global: --wal PATH  --sidecar PATH  --config PATH.json
 //!         --data-dir DIR  --db NAME     (multi-database layout)
@@ -464,6 +465,9 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 sleep_every: every("sleep-every")?,
                 consolidate_every: every("consolidate-every")?,
                 checkpoint_every: every("checkpoint-every")?,
+                max_db_bytes: a.get_usize("max-db-mb").unwrap_or(0) * 1024 * 1024,
+                max_db_edges: a.get_usize("max-db-edges").unwrap_or(0),
+                max_mem_bytes: a.get_usize("max-mem-mb").unwrap_or(0) * 1024 * 1024,
             };
             serve::run(opts)?;
         }
