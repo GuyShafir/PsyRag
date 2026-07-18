@@ -37,6 +37,10 @@ pub struct Entity {
     pub props: Value,
     #[serde(default)]
     pub edges: Vec<EntityEdge>,
+    /// Provenance label for this entity's facts; overrides the batch-level
+    /// origin passed to ingestion.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,13 +51,16 @@ pub struct EntityEdge {
     pub dst_type: Option<String>,
 }
 
-/// Translate one entity into an op batch.
-pub fn entity_ops(e: &Entity, ts: Ts) -> Batch {
+/// Translate one entity into an op batch. `default_origin` labels every fact
+/// unless the entity carries its own `origin`.
+pub fn entity_ops(e: &Entity, ts: Ts, default_origin: Option<&str>) -> Batch {
+    let origin = e.origin.as_deref().or(default_origin).map(String::from);
     let mut ops = vec![Op::ObserveNode {
         name: e.name.clone(),
         asset_type: e.entity_type.clone(),
         props: e.props.clone(),
         ts,
+        origin: origin.clone(),
     }];
     for edge in &e.edges {
         ops.push(Op::ObservePlaceholder {
@@ -63,12 +70,14 @@ pub fn entity_ops(e: &Entity, ts: Ts) -> Batch {
                 .clone()
                 .unwrap_or_else(|| "unknown/unknown".to_string()),
             ts,
+            origin: origin.clone(),
         });
         ops.push(Op::ObserveEdge {
             src: e.name.clone(),
             dst: edge.dst.clone(),
             kind: edge.kind.clone(),
             ts,
+            origin: origin.clone(),
         });
     }
     (ops, vec![e.name.clone()])
@@ -96,8 +105,24 @@ pub fn ingest_entities<S: OpSink>(
     ts: Ts,
     reconcile: bool,
 ) -> Result<Vec<String>, String> {
+    ingest_entities_from(sink, json, ts, reconcile, None)
+}
+
+/// `ingest_entities` with a batch-level provenance label.
+pub fn ingest_entities_from<S: OpSink>(
+    sink: &mut S,
+    json: &str,
+    ts: Ts,
+    reconcile: bool,
+    origin: Option<&str>,
+) -> Result<Vec<String>, String> {
     let entities = parse_entities(json)?;
-    ingest_snapshot_ops(sink, entities.iter().map(|e| entity_ops(e, ts)), ts, reconcile)
+    ingest_snapshot_ops(
+        sink,
+        entities.iter().map(|e| entity_ops(e, ts, origin)),
+        ts,
+        reconcile,
+    )
 }
 
 /// Convenience for the in-memory graph.

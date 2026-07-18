@@ -63,6 +63,9 @@ pub type EdgeId = u32;
 pub struct NodeVersion {
     pub observed_at: Ts,
     pub retired_at: Ts, // T_MAX = open
+    /// Interned provenance label (0 = none). Per-version: each observation
+    /// records where it came from.
+    pub origin_id: u32,
     pub props_hash: u64,
     /// Canonical serialized JSON. Stored as bytes, not a Value tree: a
     /// parsed Value costs ~7x the serialized size in heap (measured), and
@@ -113,6 +116,9 @@ pub struct Edge {
     pub src: NodeId,
     pub dst: NodeId,
     pub kind_id: u32,
+    /// Interned provenance label (0 = none), set at first observation of
+    /// this open interval.
+    pub origin_id: u32,
     pub valid_from: Ts,
     pub valid_to: Ts, // T_MAX = open
 }
@@ -138,11 +144,18 @@ pub enum Op {
         asset_type: String,
         props: Value,
         ts: Ts,
+        /// Provenance label (source/session/principal — opaque to the graph;
+        /// prefix conventions like "user:alice/session:42" enable
+        /// purge-by-subject). Absent on pre-provenance logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     ObservePlaceholder {
         name: String,
         inferred_type: String,
         ts: Ts,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     RetireNode {
         name: String,
@@ -153,6 +166,8 @@ pub enum Op {
         dst: String,
         kind: String,
         ts: Ts,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     RetireEdge {
         src: String,
@@ -170,6 +185,9 @@ pub enum Op {
 pub struct TemporalGraph {
     pub types: Interner,
     pub kinds: Interner,
+    /// Provenance labels ("who/where did this fact come from"), interned.
+    /// Id 0 is reserved for "" = no recorded origin.
+    pub origins: Interner,
     nodes: Vec<Node>,
     name_to_id: HashMap<String, NodeId>,
     edges: Vec<Edge>,
@@ -273,6 +291,21 @@ impl TemporalGraph {
     pub fn kind_str(&self, kind_id: u32) -> &str {
         self.kinds.resolve(kind_id)
     }
+    /// Provenance label of an edge ("" = none recorded).
+    pub fn edge_origin(&self, eid: EdgeId) -> &str {
+        let id = self.edges[eid as usize].origin_id;
+        if id == 0 && self.origins.get("").is_none() {
+            return "";
+        }
+        self.origins.resolve(id)
+    }
+    /// Provenance label of a node's version alive at `t` ("" = none).
+    pub fn node_origin_at(&self, id: NodeId, t: Ts) -> &str {
+        match self.nodes[id as usize].version_at(t) {
+            Some(v) if v.origin_id != 0 => self.origins.resolve(v.origin_id),
+            _ => "",
+        }
+    }
 
     fn ensure_node(&mut self, name: &str, type_id: u32, placeholder: bool) -> NodeId {
         if let Some(&id) = self.name_to_id.get(name) {
@@ -296,10 +329,35 @@ impl TemporalGraph {
         id
     }
 
+    fn intern_origin(&mut self, origin: Option<&str>) -> u32 {
+        // Reserve interner slot 0 for "" (no origin) so origin_id 0 is
+        // always the none marker.
+        if self.origins.get("").is_none() {
+            self.origins.intern("");
+        }
+        match origin {
+            Some(o) if !o.is_empty() => self.origins.intern(o),
+            _ => 0,
+        }
+    }
+
     /// Record an observation of a node's state at `ts`. No-op if the live
     /// properties are unchanged (hash-compared); otherwise closes the current
     /// version and opens a new one.
     pub fn observe_node(&mut self, name: &str, asset_type: &str, props: Value, ts: Ts) -> NodeId {
+        self.observe_node_from(name, asset_type, props, ts, None)
+    }
+
+    /// `observe_node` carrying a provenance label.
+    pub fn observe_node_from(
+        &mut self,
+        name: &str,
+        asset_type: &str,
+        props: Value,
+        ts: Ts,
+        origin: Option<&str>,
+    ) -> NodeId {
+        let origin_id = self.intern_origin(origin);
         let type_id = self.types.intern(asset_type);
         let id = self.ensure_node(name, type_id, false);
         // serde_json's default Map is BTreeMap-backed => to_string() is
@@ -316,6 +374,7 @@ impl TemporalGraph {
         node.versions.push(NodeVersion {
             observed_at: ts,
             retired_at: T_MAX,
+            origin_id,
             props_hash: h,
             props_json: s.into_boxed_str(),
         });
@@ -325,12 +384,24 @@ impl TemporalGraph {
     /// Placeholder node: something referenced `name` but we haven't ingested
     /// it yet. Alive from ts so traversals can cross partial ingestion.
     pub fn observe_placeholder(&mut self, name: &str, inferred_type: &str, ts: Ts) -> NodeId {
+        self.observe_placeholder_from(name, inferred_type, ts, None)
+    }
+
+    pub fn observe_placeholder_from(
+        &mut self,
+        name: &str,
+        inferred_type: &str,
+        ts: Ts,
+        origin: Option<&str>,
+    ) -> NodeId {
+        let origin_id = self.intern_origin(origin);
         let type_id = self.types.intern(inferred_type);
         let id = self.ensure_node(name, type_id, true);
         if self.nodes[id as usize].open_version_mut().is_none() {
             self.nodes[id as usize].versions.push(NodeVersion {
                 observed_at: ts,
                 retired_at: T_MAX,
+                origin_id,
                 props_hash: 0,
                 props_json: "null".into(),
             });
@@ -364,8 +435,21 @@ impl TemporalGraph {
         self.open_edges.remove(&key);
     }
 
-    /// Record that an edge exists at `ts`. Idempotent while the edge is open.
+    /// Record that an edge exists at `ts`. Idempotent while the edge is open
+    /// (the origin of the FIRST observation of an open interval sticks).
     pub fn observe_edge(&mut self, src: NodeId, dst: NodeId, kind: &str, ts: Ts) -> EdgeId {
+        self.observe_edge_from(src, dst, kind, ts, None)
+    }
+
+    pub fn observe_edge_from(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        kind: &str,
+        ts: Ts,
+        origin: Option<&str>,
+    ) -> EdgeId {
+        let origin_id = self.intern_origin(origin);
         let kind_id = self.kinds.intern(kind);
         let key = (src, dst, kind_id);
         if let Some(&eid) = self.open_edges.get(&key) {
@@ -376,6 +460,7 @@ impl TemporalGraph {
             src,
             dst,
             kind_id,
+            origin_id,
             valid_from: ts,
             valid_to: T_MAX,
         });
@@ -442,19 +527,19 @@ impl TemporalGraph {
     /// (NodeIds are process-local).
     pub fn apply(&mut self, op: &Op) {
         match op {
-            Op::ObserveNode { name, asset_type, props, ts } => {
-                self.observe_node(name, asset_type, props.clone(), *ts);
+            Op::ObserveNode { name, asset_type, props, ts, origin } => {
+                self.observe_node_from(name, asset_type, props.clone(), *ts, origin.as_deref());
             }
-            Op::ObservePlaceholder { name, inferred_type, ts } => {
-                self.observe_placeholder(name, inferred_type, *ts);
+            Op::ObservePlaceholder { name, inferred_type, ts, origin } => {
+                self.observe_placeholder_from(name, inferred_type, *ts, origin.as_deref());
             }
             Op::RetireNode { name, ts } => self.retire_node(name, *ts),
-            Op::ObserveEdge { src, dst, kind, ts } => {
+            Op::ObserveEdge { src, dst, kind, ts, origin } => {
                 // Edges may arrive before either endpoint's real record;
                 // materialize endpoints as untyped placeholders if needed.
                 let s = self.placeholder_if_absent(src, *ts);
                 let d = self.placeholder_if_absent(dst, *ts);
-                self.observe_edge(s, d, kind, *ts);
+                self.observe_edge_from(s, d, kind, *ts, origin.as_deref());
             }
             Op::RetireEdge { src, dst, kind, ts } => {
                 if let (Some(s), Some(d)) = (self.id_of(src), self.id_of(dst)) {

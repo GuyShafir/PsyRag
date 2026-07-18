@@ -92,10 +92,16 @@ class PsyRagClient:
         return await self._get("/stats")
 
     async def ingest(self, entities_json: str, ts: Optional[int] = None,
-                     reconcile: bool = False, cai: bool = False) -> dict:
+                     reconcile: bool = False, cai: bool = False,
+                     origin: Optional[str] = None) -> dict:
+        """`origin` labels every fact in the batch with its provenance
+        (conventions like "user:alice/session:42" enable trust levels and
+        purge-by-subject); a per-entity `origin` in the payload overrides."""
         body: dict[str, Any] = {"json": entities_json, "reconcile": reconcile, "cai": cai}
         if ts is not None:
             body["ts"] = ts
+        if origin is not None:
+            body["origin"] = origin
         return await self._post_idem("/ingest", body)
 
     async def retrieve(self, seeds: list[str], depth: Optional[int] = None,
@@ -147,6 +153,18 @@ class PsyRagClient:
         """Resolve free-text tokens to existing node names (substring, case-insensitive)."""
         r = await self._post("/match", {"tokens": tokens, "limit": limit})
         return r.get("nodes", [])
+
+    async def quarantine(self, origin_prefix: str, trust: float = 0.0) -> dict:
+        """Set the trust level for a provenance prefix. 0.0 removes the
+        source's influence from retrieval entirely (a mask — learned weights
+        are untouched); 1.0 restores it."""
+        return await self._post("/quarantine",
+                                {"origin_prefix": origin_prefix, "trust": trust})
+
+    async def purge(self, origin_prefix: str) -> dict:
+        """Irreversibly delete every fact whose provenance matches the prefix
+        (GDPR deletion-by-subject). Requires a server running with --token."""
+        return await self._post_idem("/purge", {"origin_prefix": origin_prefix})
 
     # -- multi-db admin (server-level routes, independent of this client's db) --
     async def create_db(self, name: str) -> dict:

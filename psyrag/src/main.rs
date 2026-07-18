@@ -2,7 +2,7 @@
 //!
 //! Commands:
 //!   psyrag config [--write PATH]
-//!   psyrag ingest --file F [--reconcile] [--cai] [--ts MS]
+//!   psyrag ingest --file F [--reconcile] [--cai] [--ts MS] [--origin LABEL]
 //!   psyrag retrieve --seed N [--seed N...] [--depth D] [--fan F] [--top-k K] [--ts MS] [--adapt]
 //!   psyrag touch --edge src,dst,kind,R [--edge ...] [--ts MS]
 //!   psyrag feedback --seed N... {--used NODE... | --credit name,score... | --reward R [--spread by_activation|uniform]} [--depth D] [--ts MS]
@@ -11,6 +11,7 @@
 //!   psyrag checkpoint [--no-archive]        (compact the WAL, archive history)
 //!   psyrag verify                           (read-only WAL + sidecar check)
 //!   psyrag backup --out DIR                 (consistent file-copy backup)
+//!   psyrag purge --origin PREFIX            (drop every fact from a provenance)
 //!   psyrag db {list | create NAME}          (requires --data-dir)
 //!   psyrag serve [--addr HOST:PORT] [--token T] [--read-token T] [--workers N]
 //!                [--max-body-mb N] [--max-open-dbs N]
@@ -34,7 +35,7 @@ use std::path::Path;
 
 const USAGE: &str = "psyrag <command> [flags]
 commands: config ingest retrieve touch feedback consolidate sleep stats
-          checkpoint verify backup export-bq db serve monitor
+          checkpoint verify backup purge export-bq db serve monitor
 global:   --wal PATH  --sidecar PATH  --config PATH.json  --data-dir DIR  --db NAME
 run `psyrag config` to see all tunables.";
 
@@ -116,7 +117,7 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 #[cfg(not(feature = "gcp"))]
                 { return Err("built without gcp feature".into()); }
             } else {
-                e.pg.ingest_entities(&json, t, a.has("reconcile"))?
+                e.pg.ingest_entities_from(&json, t, a.has("reconcile"), a.get("origin"))?
             };
             e.layer.sync(e.pg.graph());
             e.save_sidecar()?;
@@ -257,6 +258,19 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 "out": out, "dataset": dataset,
                 "files": ["nodes.jsonl","edges.jsonl","traces.jsonl","schema.sql","queries.gql","load.sh"]
             }));
+        }
+        Some("purge") => {
+            let prefix = a.get("origin").ok_or("--origin PREFIX required")?;
+            let mut e = open_engine(a)?;
+            let snap = e.layer.snapshot_keys(e.pg.graph());
+            let report = e.pg.purge(prefix)?;
+            e.layer.restore_keys(e.pg.graph(), &snap);
+            e.save_sidecar()?;
+            let trace_log = format!("{}.traces.jsonl", e.sidecar_path);
+            if Path::new(&trace_log).exists() {
+                std::fs::write(&trace_log, b"").map_err(|x| x.to_string())?;
+            }
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         Some("checkpoint") => {
             let mut e = open_engine(a)?;

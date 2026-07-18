@@ -276,6 +276,17 @@ pub struct CompactReport {
     pub archive: Option<String>,
 }
 
+/// What a `purge()` removed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PurgeReport {
+    pub nodes_dropped: usize,
+    pub edges_dropped: usize,
+    pub ops_written: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub note: String,
+}
+
 impl OpSink for PersistentGraph {
     fn record(&mut self, op: Op) -> Result<(), String> {
         let json = serde_json::to_string(&op).map_err(|e| e.to_string())?;
@@ -424,24 +435,82 @@ impl PersistentGraph {
     /// follow via their stable edge keys, but in-memory retrieval traces are
     /// invalidated (the caller clears its trace store).
     pub fn compact(&mut self, archive: bool) -> Result<CompactReport, String> {
-        self.flush()?;
-        let bytes_before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let (ops, _, _) = self.open_state_ops(None);
+        let (bytes_before, bytes_after, archive_path) = self.rewrite_wal(&ops, archive)?;
+        Ok(CompactReport {
+            ops_written: ops.len(),
+            bytes_before,
+            bytes_after,
+            archive: archive_path,
+        })
+    }
 
-        // 1. Synthesize the open-state ops: nodes first (real types), then
-        //    placeholders, then open edges — replay order matters for typing.
+    /// **Purge by provenance**: rewrite the WAL to open state EXCLUDING every
+    /// fact whose origin starts with `origin_prefix` — nodes whose current
+    /// version came from it, edges observed from it, and edges touching a
+    /// purged node (keeping those would resurrect the purged name as a
+    /// placeholder). The in-memory graph is rebuilt from the purged op set,
+    /// so removal is complete without a restart. Never archives (that would
+    /// keep the purged data next to the log); the caller is responsible for
+    /// pre-existing archives and backups, which still contain it.
+    pub fn purge(&mut self, origin_prefix: &str) -> Result<PurgeReport, String> {
+        if origin_prefix.is_empty() {
+            return Err("refusing to purge with an empty origin prefix (would drop everything unlabeled)".into());
+        }
+        let (ops, nodes_dropped, edges_dropped) = self.open_state_ops(Some(origin_prefix));
+        let (bytes_before, bytes_after, _) = self.rewrite_wal(&ops, false)?;
+        // Rebuild the in-memory graph from exactly what the new log holds:
+        // the purged facts are gone from memory too, not just from disk.
+        let mut fresh = TemporalGraph::new();
+        for op in &ops {
+            fresh.apply(op);
+        }
+        self.graph = fresh;
+        Ok(PurgeReport {
+            nodes_dropped,
+            edges_dropped,
+            ops_written: ops.len(),
+            bytes_before,
+            bytes_after,
+            note: "pre-existing WAL archives and backups still contain the purged data; rotate or delete them separately".into(),
+        })
+    }
+
+    /// Synthesize the ops that reconstruct current open state (nodes first —
+    /// replay order matters for typing — then placeholders, then open edges),
+    /// optionally dropping everything whose provenance matches
+    /// `drop_origin_prefix`. Returns (ops, nodes_dropped, edges_dropped).
+    fn open_state_ops(&self, drop_origin_prefix: Option<&str>) -> (Vec<Op>, usize, usize) {
+        use std::collections::HashSet;
         let g = &self.graph;
+        let matches = |origin_id: u32| -> bool {
+            match drop_origin_prefix {
+                Some(p) if origin_id != 0 => g.origins.resolve(origin_id).starts_with(p),
+                _ => false,
+            }
+        };
         let mut ops: Vec<Op> = Vec::new();
+        let mut dropped_nodes: HashSet<crate::graph::NodeId> = HashSet::new();
+        let mut nodes_dropped = 0usize;
         for id in 0..g.node_count() {
             let n = g.node(id as crate::graph::NodeId);
             let Some(v) = n.versions.last().filter(|v| v.retired_at == crate::graph::T_MAX) else {
                 continue; // fully retired: drop from the working log
             };
+            if matches(v.origin_id) {
+                dropped_nodes.insert(id as crate::graph::NodeId);
+                nodes_dropped += 1;
+                continue;
+            }
             let type_str = g.types.resolve(n.type_id).to_string();
+            let origin = (v.origin_id != 0)
+                .then(|| g.origins.resolve(v.origin_id).to_string());
             if n.placeholder {
                 ops.push(Op::ObservePlaceholder {
                     name: n.name.clone(),
                     inferred_type: type_str,
                     ts: v.observed_at,
+                    origin,
                 });
             } else {
                 ops.push(Op::ObserveNode {
@@ -449,23 +518,47 @@ impl PersistentGraph {
                     asset_type: type_str,
                     props: v.props_value(),
                     ts: v.observed_at,
+                    origin,
                 });
             }
         }
+        let mut edges_dropped = 0usize;
         for eid in 0..g.edge_count() {
             let e = g.edge(eid as crate::graph::EdgeId);
             if e.valid_to != crate::graph::T_MAX {
                 continue; // closed edge: history, dropped
+            }
+            if matches(e.origin_id)
+                || dropped_nodes.contains(&e.src)
+                || dropped_nodes.contains(&e.dst)
+            {
+                edges_dropped += 1;
+                continue;
             }
             ops.push(Op::ObserveEdge {
                 src: g.node_name(e.src).to_string(),
                 dst: g.node_name(e.dst).to_string(),
                 kind: g.kind_str(e.kind_id).to_string(),
                 ts: e.valid_from,
+                origin: (e.origin_id != 0)
+                    .then(|| g.origins.resolve(e.origin_id).to_string()),
             });
         }
+        (ops, nodes_dropped, edges_dropped)
+    }
 
-        // 2. Write + lock the replacement before touching the live name.
+    /// Write `ops` as a fresh framed log and atomically swap it in as the
+    /// live WAL, adopting its (already-locked) fd as the writer. Returns
+    /// (bytes_before, bytes_after, archive_path).
+    fn rewrite_wal(
+        &mut self,
+        ops: &[Op],
+        archive: bool,
+    ) -> Result<(u64, u64, Option<String>), String> {
+        self.flush()?;
+        let bytes_before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+
+        // Write + lock the replacement before touching the live name.
         // (Names are appended to the full filename — with_extension would
         // clobber a ".wal" suffix.)
         let tmp_path = std::path::PathBuf::from(format!("{}.compact.tmp", self.path.display()));
@@ -482,7 +575,7 @@ impl PersistentGraph {
         let id = self.wal_id.clone().unwrap_or_else(new_wal_id);
         w.write_all(format!("{WAL_HEADER} id={id}\n").as_bytes())
             .map_err(|e| e.to_string())?;
-        for op in &ops {
+        for op in ops {
             let json = serde_json::to_string(op).map_err(|e| e.to_string())?;
             let line = format!("{:08x}:{}\n", crc32(json.as_bytes()), json);
             w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
@@ -531,12 +624,7 @@ impl PersistentGraph {
         self.lsn = ops.len() as u64;
 
         let bytes_after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        Ok(CompactReport {
-            ops_written: ops.len(),
-            bytes_before,
-            bytes_after,
-            archive: archive_path,
-        })
+        Ok((bytes_before, bytes_after, archive_path))
     }
 
     /// Read access to the underlying graph (all temporal queries live there).
@@ -575,7 +663,18 @@ impl PersistentGraph {
         ts: Ts,
         reconcile: bool,
     ) -> Result<Vec<String>, String> {
-        let stale = entity::ingest_entities(self, json, ts, reconcile)?;
+        self.ingest_entities_from(json, ts, reconcile, None)
+    }
+
+    /// `ingest_entities` with a batch-level provenance label.
+    pub fn ingest_entities_from(
+        &mut self,
+        json: &str,
+        ts: Ts,
+        reconcile: bool,
+        origin: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let stale = entity::ingest_entities_from(self, json, ts, reconcile, origin)?;
         self.flush()?;
         Ok(stale)
     }
@@ -620,6 +719,7 @@ mod tests {
             asset_type: "t/x".into(),
             props: serde_json::json!({"k": 1}),
             ts: 5,
+            origin: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         let line = format!("{:08x}:{}", crc32(json.as_bytes()), json);

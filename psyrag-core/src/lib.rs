@@ -85,6 +85,13 @@ pub struct Config {
     pub authority_by_kind: HashMap<String, f32>,
     pub authority_default: f32,
 
+    /// Trust level per provenance-origin PREFIX (longest match wins;
+    /// unlisted origins and unlabeled facts get 1.0). Applied as a
+    /// retrieval-time multiplier on edge salience — 0.0 quarantines a
+    /// source's influence entirely. A retrieval MASK like the dead bit:
+    /// stored weights are untouched, so restoring trust restores recall.
+    pub trust_by_origin: HashMap<String, f32>,
+
     /// Edge kinds that are *functional* (single-valued): a source may have at
     /// most one open edge of this kind. Only these are checked for ground-truth
     /// contradictions during consolidation. Multi-valued predicates (CONNECTS,
@@ -140,6 +147,7 @@ impl Default for Config {
             norm_target: 1.0,
             authority_by_kind: HashMap::new(),
             authority_default: 0.0,
+            trust_by_origin: HashMap::new(),
             functional_kinds: std::collections::HashSet::new(),
             feedback_gamma: 0.5,
             feedback_hit: 1.0,
@@ -216,6 +224,8 @@ pub struct NodeAct {
     pub node: String,
     pub node_type: String,
     pub activation: f32,
+    /// Provenance of the node's current version ("" = none recorded).
+    pub origin: String,
 }
 
 /// One edge that carried activation during a retrieval (hop order).
@@ -352,6 +362,9 @@ pub struct PlasticityLayer {
     t_last: Vec<Ts>,
     neg_lambda: Vec<f32>,
     dead: Vec<bool>,
+    /// Retrieval-time trust multiplier per edge (from `trust_by_origin`);
+    /// derived from graph provenance + config, never persisted.
+    trust: Vec<f32>,
 
     lambda_scale: AtomicU32,
 
@@ -373,6 +386,7 @@ impl PlasticityLayer {
             t_last: Vec::new(),
             neg_lambda: Vec::new(),
             dead: Vec::new(),
+            trust: Vec::new(),
             lambda_scale: AtomicU32::new(1.0f32.to_bits()),
             wal_binding: None,
             loaded_binding: None,
@@ -397,6 +411,25 @@ impl PlasticityLayer {
         self.lambda_scale.store(s.to_bits(), Ordering::Relaxed);
     }
 
+    /// Trust multiplier for an edge from its provenance origin: longest
+    /// matching prefix in `trust_by_origin`, else 1.0.
+    fn trust_of(&self, g: &TemporalGraph, eid: EdgeId) -> f32 {
+        if self.cfg.trust_by_origin.is_empty() {
+            return 1.0;
+        }
+        let origin = g.edge_origin(eid);
+        if origin.is_empty() {
+            return 1.0;
+        }
+        self.cfg
+            .trust_by_origin
+            .iter()
+            .filter(|(prefix, _)| origin.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, t)| t.max(0.0))
+            .unwrap_or(1.0)
+    }
+
     /// Grow the sidecar to cover every edge in the graph. New edges are seeded
     /// with `w0`, `t_last = edge.valid_from`, and a per-edge lambda derived from
     /// the edge kind's authority. Call after each ingest batch. O(new edges).
@@ -415,7 +448,29 @@ impl PlasticityLayer {
             self.t_last.push(e.valid_from);
             self.neg_lambda.push(-lam);
             self.dead.push(false);
+            self.trust.push(self.trust_of(g, eid as EdgeId));
         }
+    }
+
+    /// Recompute the whole trust column from graph provenance + config. Call
+    /// after changing `trust_by_origin` (e.g. a quarantine). O(edges).
+    pub fn resync_trust(&mut self, g: &TemporalGraph) {
+        let n = self.w.len().min(g.edge_count());
+        self.trust.resize(n, 1.0);
+        for eid in 0..n {
+            self.trust[eid] = self.trust_of(g, eid as EdgeId);
+        }
+    }
+
+    /// Set (or update) a trust level for an origin prefix and re-resolve the
+    /// per-edge mask. `trust = 0.0` quarantines the source; removing the
+    /// entry later (or setting 1.0) restores its influence — stored weights
+    /// are never modified by trust.
+    pub fn set_trust(&mut self, g: &TemporalGraph, origin_prefix: &str, trust: f32) {
+        self.cfg
+            .trust_by_origin
+            .insert(origin_prefix.to_string(), trust.max(0.0));
+        self.resync_trust(g);
     }
 
     #[inline]
@@ -428,9 +483,21 @@ impl PlasticityLayer {
         self.w[i] * (self.neg_lambda[i] * scale * dt).exp()
     }
 
-    /// True current retrieval weight of an edge (pure read).
+    /// Trust-masked salience: raw decayed weight x provenance trust. This is
+    /// what retrieval sees; state maintenance (touch/consolidate/sleep) uses
+    /// the raw weight so a quarantine never destroys learned state.
+    #[inline]
+    fn eff_trusted(&self, eid: EdgeId, t_now: Ts, scale: f32) -> f32 {
+        let t = self.trust.get(eid as usize).copied().unwrap_or(1.0);
+        if t <= 0.0 {
+            return 0.0;
+        }
+        self.eff(eid, t_now, scale) * t
+    }
+
+    /// True current retrieval weight of an edge (pure read, trust-masked).
     pub fn effective_weight(&self, eid: EdgeId, t_now: Ts) -> f32 {
-        self.eff(eid, t_now, self.lambda_scale())
+        self.eff_trusted(eid, t_now, self.lambda_scale())
     }
 
     /// Reinforce edges: decay-to-now then add alpha*clip(R). Batch write.
@@ -519,7 +586,7 @@ impl PlasticityLayer {
                 for &eid in g.out_edge_ids(u) {
                     let e = g.edge(eid);
                     if e.alive_at(t_now) {
-                        out_mass += self.eff(eid, t_now, scale).max(0.0);
+                        out_mass += self.eff_trusted(eid, t_now, scale).max(0.0);
                     }
                 }
                 if out_mass <= 0.0 {
@@ -532,7 +599,7 @@ impl PlasticityLayer {
                     if !e.alive_at(t_now) {
                         continue;
                     }
-                    let we = self.eff(eid, t_now, scale).max(0.0);
+                    let we = self.eff_trusted(eid, t_now, scale).max(0.0);
                     let v = e.dst as usize;
                     let delta = outflow * (we / out_mass);
                     if delta > eps {
@@ -566,6 +633,7 @@ impl PlasticityLayer {
                 node: g.node_name(id).to_string(),
                 node_type: g.node_type(id).to_string(),
                 activation: a,
+                origin: g.node_origin_at(id, t_now).to_string(),
             })
             .collect();
         (
@@ -1130,7 +1198,51 @@ impl PlasticityLayer {
         }
         self.set_lambda_scale(p.lambda_scale);
         self.homeo = p.homeo;
+        // Trust is derived state; rebuild it for whatever columns we now have
+        // (the v1 positional path bypasses sync's incremental growth).
+        self.resync_trust(g);
         Ok(())
+    }
+
+    /// A keyed snapshot of the sidecar columns for rebuilding after an
+    /// operation that renumbers EdgeIds in-process (purge). Pair with
+    /// `restore_keys` against the post-renumbering graph.
+    pub fn snapshot_keys(&self, g: &TemporalGraph) -> Vec<(u64, f32, Ts, f32, bool)> {
+        let n = self.w.len().min(g.edge_count());
+        (0..n)
+            .map(|i| {
+                (
+                    stable_edge_key(g, i as EdgeId),
+                    self.w[i],
+                    self.t_last[i],
+                    self.neg_lambda[i],
+                    self.dead[i],
+                )
+            })
+            .collect()
+    }
+
+    /// Rebuild the columns against `g`, carrying over state by stable key.
+    /// Entries whose edge no longer exists are dropped (that is the point,
+    /// after a purge); new edges seed fresh.
+    pub fn restore_keys(&mut self, g: &TemporalGraph, snap: &[(u64, f32, Ts, f32, bool)]) {
+        let by_key: HashMap<u64, usize> =
+            snap.iter().enumerate().map(|(i, e)| (e.0, i)).collect();
+        self.w.clear();
+        self.t_last.clear();
+        self.neg_lambda.clear();
+        self.dead.clear();
+        self.trust.clear();
+        self.sync(g);
+        for eid in 0..g.edge_count() {
+            if let Some(&i) = by_key.get(&stable_edge_key(g, eid as EdgeId)) {
+                let (_, w, t_last, neg_lambda, dead) = snap[i];
+                self.w[eid] = w;
+                self.t_last[eid] = t_last;
+                self.neg_lambda[eid] = neg_lambda;
+                self.dead[eid] = dead;
+            }
+        }
     }
 
     /// Resolve an edge id from endpoint names + kind (for touch by name).
@@ -1436,6 +1548,55 @@ mod tests {
         assert!(p.effective_weight(ha, 100 * S) > 0.0, "consolidated edge survives");
         assert!(p.effective_weight(he, 100 * S) == 0.0, "weak edge pruned in sleep");
         assert!(rep.protected >= 1 && rep.pruned >= 1);
+    }
+
+    #[test]
+    fn quarantine_masks_and_restores_without_touching_weights() {
+        // hub -> tainted (origin evil:1), hub -> clean (no origin).
+        let json = r#"[
+            {"name":"hub","type":"t","edges":[{"dst":"clean","kind":"REL"}]},
+            {"name":"hub","type":"t","origin":"evil:1","edges":[
+                {"dst":"clean","kind":"REL"},{"dst":"tainted","kind":"BAD"}]}
+        ]"#;
+        // (second record re-observes hub; its new BAD edge carries evil:1)
+        let mut g = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g, json, 0, false).unwrap();
+        let mut cfg = Config::default();
+        cfg.lambda_base = 0.0;
+        let mut p = PlasticityLayer::new(cfg);
+        p.sync(&g);
+        let bad = p.edge_id(&g, "hub", "tainted", "BAD").unwrap();
+        assert!(p.effective_weight(bad, 1 * S) > 0.0, "visible before quarantine");
+        let r0 = p.retrieve(&g, &["hub"], 1, 0.9, 10, 1 * S);
+        assert!(r0.top.iter().any(|n| n.node == "tainted"));
+
+        p.set_trust(&g, "evil:", 0.0);
+        assert_eq!(p.effective_weight(bad, 1 * S), 0.0, "masked");
+        let r1 = p.retrieve(&g, &["hub"], 1, 0.9, 10, 1 * S);
+        assert!(
+            !r1.top.iter().any(|n| n.node == "tainted"),
+            "quarantined source's influence gone: {:?}",
+            r1.top
+        );
+        // clean edge unaffected
+        assert!(r1.top.iter().any(|n| n.node == "clean"));
+
+        // Restore: the stored weight was never modified.
+        p.set_trust(&g, "evil:", 1.0);
+        assert!(p.effective_weight(bad, 1 * S) > 0.0, "restored, not destroyed");
+    }
+
+    #[test]
+    fn retrieval_reports_node_origin() {
+        let json = r#"[{"name":"src","type":"t","origin":"sess:42",
+            "edges":[{"dst":"other","kind":"REL"}]}]"#;
+        let mut g = TemporalGraph::new();
+        psyrag_graph::entity::ingest_entities_mem(&mut g, json, 0, false).unwrap();
+        let mut p = PlasticityLayer::new(Config::default());
+        p.sync(&g);
+        let r = p.retrieve(&g, &["src"], 1, 0.9, 10, 1 * S);
+        let src = r.top.iter().find(|n| n.node == "src").unwrap();
+        assert_eq!(src.origin, "sess:42");
     }
 
     #[test]
