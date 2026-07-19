@@ -1135,6 +1135,19 @@ fn handle_db(
             }
         }
         (Method::Get, "/health") => json_resp(&serde_json::json!({"ok": true}), 200),
+        (Method::Get, "/config") => {
+            let e = db.engine.read().unwrap();
+            json_resp(
+                &serde_json::json!({
+                    "config": e.layer.cfg,
+                    // Whether PUT /config (and /quarantine) persists to this
+                    // DB's config.json (multi-DB mode) or applies in-memory
+                    // only (single-DB legacy mode).
+                    "persistent": db.cfg_path.is_some(),
+                }),
+                200,
+            )
+        }
         (Method::Get, "/stats") => {
             let e = db.engine.read().unwrap();
             json_resp(&e.layer.stats(e.pg.graph()), 200)
@@ -1560,6 +1573,32 @@ fn handle_db_write(
                     "traces_cleared": true,
                     "note": "in-memory graph keeps full history until restart; the on-disk log is compacted",
                 }),
+                200,
+            )
+        }
+        (Method::Put, "/config") => {
+            // JSON cannot encode NaN/Infinity, so parsed numerics are finite.
+            let cfg: Config = match serde_json::from_str(body) {
+                Ok(c) => c,
+                Err(e) => return jerr(&format!("bad config: {e}"), 400),
+            };
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            e.layer.set_config(e.pg.graph(), cfg);
+            let persisted = match &db.cfg_path {
+                Some(cp) => {
+                    let s = serde_json::to_string_pretty(&e.layer.cfg).unwrap_or_default();
+                    match std::fs::write(cp, s) {
+                        Ok(()) => true,
+                        Err(er) => {
+                            return jerr(&format!("config applied but not persisted: {er}"), 500)
+                        }
+                    }
+                }
+                None => false,
+            };
+            jout(
+                &serde_json::json!({"applied": true, "persisted": persisted}),
                 200,
             )
         }
