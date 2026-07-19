@@ -236,6 +236,18 @@ The web console (HTML). See [integrations.md](integrations.md).
 Sidecar + graph stats: `nodes`, `edges_total`, `edges_live`, `edges_dead`,
 `lambda_scale`, `setpoint`, `ewma_mass`, `integral`, `weight_min/mean/max`.
 
+### `GET /config` and `PUT /config`
+`GET` returns `{ config, persistent }` — the database's effective plasticity
+config and whether edits persist (`true` in multi-DB mode, where they are
+written to the DB's `config.json`; `false` in single-DB mode, where they
+apply in-memory until restart). `PUT` takes a config JSON (same shape as
+`psyrag config --write`; omitted fields take defaults), applies it **live**,
+and re-resolves all derived state: per-edge decay (`authority_by_kind` /
+`lambda_base` / `beta`), the trust mask, and the homeostat's controller
+parameters (its runtime state — integral, EWMA — is kept). Learned weights
+are never modified by a config change. `GET` is allowed under the read
+scope; `PUT` requires write scope.
+
 ### `POST /ingest`
 `{ "json": "<entities>", "reconcile"?: bool, "cai"?: bool, "ts"?: int }` →
 `{ "edges", "nodes", "stale_retired" }`.

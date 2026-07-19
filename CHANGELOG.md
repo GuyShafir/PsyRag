@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Web console catches up with the server
+- The console (served at `/`) now covers the whole v0.4.0 surface: bearer-token
+  auth (full / read-only / db-scoped), a multi-database picker with
+  create/drop, maintenance (sleep / checkpoint / consolidate), trust
+  quarantine + purge-by-origin with type-to-confirm, ingest with provenance
+  origin + CAI mode, `/touch`, seed search via `/match`, explain-mode
+  retrieval with per-node graded feedback, a live settings editor, and a
+  server panel (per-DB state, uptime, request counters/latency from
+  `/metrics`). Tabs are deep-linkable (`/ui#trust`). Still a single
+  self-contained HTML file with zero external assets.
+- New API: `GET /config` (effective per-DB config; read scope) and
+  `PUT /config` (replace config; applied live — decay/authority, trust mask,
+  and homeostat parameters re-resolve without touching learned weights or
+  controller runtime state; persists to the DB's `config.json` in multi-DB
+  mode). `config` route class added to `/metrics`.
+
 ## v0.4.0 — 2026-07-18 (first tagged release)
 
 The production-hardening release: PsyRag goes from prototype to a standalone

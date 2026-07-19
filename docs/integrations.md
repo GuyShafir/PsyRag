@@ -2,22 +2,39 @@
 
 ## Web console
 
-`psyrag serve` hosts a self-contained console at `/` (no external assets). Four
-tabs:
+`psyrag serve` hosts a self-contained console at `/` (no external assets). The
+header holds the **bearer token** field (stored in the browser, sent on every
+request — required when the server runs with `--token`/`--read-token`/
+`--db-token`) and the **database picker** (multi-DB aware; with a db-scoped
+token, type the database name directly). Tabs are deep-linkable (`/ui#trust`):
 
-- **Dashboard** — live homeostat (λ-scale, setpoint, ewma mass, integral) and edge
-  liveness (total / live / dead), weight distribution. Auto-refreshes.
-- **Graph** — force-directed view of the graph; edge width = current weight, faded
-  = retired. Click a node to make it a retrieval seed.
-- **Retrieve & Trace** — run a retrieval and *see the trace*: node size/color is
-  activation, highlighted edges are the ones that fired. Tick the nodes that were
-  useful and "mark as used" (explicit feedback), or send an episodic reward. Watch
-  weights move on the Dashboard.
-- **Manage** — paste-and-ingest entities, run consolidation (optionally journaling
-  conflict supersessions), and browse the **durable trace store**; click a stored
-  trace id to re-visualize it.
+- **Dashboard** — live homeostat (λ-scale, setpoint, ewma mass, integral), edge
+  liveness (total / live / dead), weight distribution, database size/traces,
+  and the wedged flag. Auto-refreshes.
+- **Graph** — force-directed view of the graph; edge width = current
+  (trust-masked) weight, faded = retired. Click a node to make it a seed.
+- **Retrieve** — seed search via `POST /match` (indexed token-prefix or
+  substring), full retrieval controls (depth / fan / top-k / ts / adapt /
+  trace / explain), the fired-edge **explain table**, and the trace subgraph
+  visualization. Feedback in all three modes: mark-as-used, per-node graded
+  scores, or episodic reward. Under a read-only token retrieval automatically
+  drops `adapt`/`trace`.
+- **Ingest** — paste-and-ingest entities with **origin** (provenance label),
+  reconcile, and CAI-snapshot mode; direct edge reinforcement via `/touch`.
+- **Maintenance** — consolidate (optionally journaling conflict
+  supersessions), sleep, WAL checkpoint, and the **durable trace store**;
+  click a stored trace id to re-visualize it.
+- **Trust** — the `trust_by_origin` mask with one-click quarantine/restore,
+  and the irreversible **purge-by-origin** (type-to-confirm; requires
+  `--token` server-side).
+- **Settings** — view and edit the database's full plasticity config
+  (`GET`/`PUT /config`); changes apply live and persist to the DB's
+  `config.json` in multi-DB mode.
+- **Server** — database list with create/drop (type-to-confirm), per-DB
+  state/size, uptime, memory budget, and request counters/latency by route
+  (parsed from `/metrics`). Hidden for db-scoped tokens.
 
-Suggested first run: ingest a small graph → Graph tab (load) → click a node →
+Suggested first run: ingest a small graph → Graph tab → click a node →
 Retrieve → mark a result useful a few times → re-Retrieve and watch it climb.
 
 ## Python / Google ADK

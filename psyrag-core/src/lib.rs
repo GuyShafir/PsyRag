@@ -209,6 +209,19 @@ impl Homeostat {
     pub fn integral(&self) -> f32 {
         self.integral
     }
+    /// Adopt new controller parameters while keeping runtime state
+    /// (integral, ewma_mass, primed) — a config edit must not reset the
+    /// controller and transiently distort lambda_scale.
+    fn reconfigure(&mut self, c: &Config) {
+        self.setpoint = c.setpoint;
+        self.k_i = c.k_i;
+        self.ewma_beta = c.ewma_beta;
+        self.scale_min = c.scale_min;
+        self.scale_max = c.scale_max;
+        self.i_min = c.integral_min;
+        self.i_max = c.integral_max;
+        self.integral = self.integral.clamp(self.i_min, self.i_max);
+    }
 }
 
 // ===========================================================================
@@ -484,6 +497,17 @@ impl PlasticityLayer {
         for eid in 0..n {
             self.trust[eid] = self.trust_of(g, eid as EdgeId);
         }
+    }
+
+    /// Replace the whole config and re-resolve every piece of derived state:
+    /// per-edge decay (authority), the trust mask, and the homeostat's
+    /// controller parameters (runtime state — integral, ewma — is kept).
+    /// Learned weights are never modified by a config change.
+    pub fn set_config(&mut self, g: &TemporalGraph, cfg: Config) {
+        self.homeo.reconfigure(&cfg);
+        self.cfg = cfg;
+        self.resync_authority(g);
+        self.resync_trust(g);
     }
 
     /// Set (or update) a trust level for an origin prefix and re-resolve the
