@@ -40,11 +40,11 @@ Where a RAG store returns the same thing forever, PsyRag learns.
 
 ```bash
 # linux x86-64
-curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.4.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.5.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
 # linux arm64 (Graviton, Ampere, Raspberry Pi)
-curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.4.0-aarch64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.5.0-aarch64-unknown-linux-gnu.tar.gz | tar xz
 # macOS (Apple silicon)
-curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.4.0-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.5.0-aarch64-apple-darwin.tar.gz | tar xz
 
 ./psyrag --wal mem.wal serve
 ```
@@ -109,7 +109,7 @@ Every claim below is enforced by CI on every push:
   *product*: recall must reorder around what proved useful, and stay
   deterministic, or CI fails.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.4.0 story, and the
+See [CHANGELOG.md](CHANGELOG.md) for the full release story, and the
 [releases page](https://github.com/GuyShafir/PsyRag/releases) for binaries
 and the Docker image.
 

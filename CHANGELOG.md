@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 — 2026-07-19
 
 ### Web console catches up with the server
 - The console (served at `/`) now covers the whole v0.4.0 surface: bearer-token
