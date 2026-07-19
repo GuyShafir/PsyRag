@@ -35,7 +35,8 @@ Where a RAG store returns the same thing forever, PsyRag learns.
 
 ## Install
 
-**Release binaries** (linux x86-64, macOS arm64) — [latest release](https://github.com/GuyShafir/PsyRag/releases/latest):
+**Release binaries** (linux x86-64, macOS arm64) from the
+[releases page](https://github.com/GuyShafir/PsyRag/releases):
 
 ```bash
 # linux x86-64
@@ -75,9 +76,9 @@ psyrag --wal mem.wal sleep                                       # nightly conso
 Or multi-tenant: `psyrag --data-dir /data/dbs serve --token $SECRET` gives every
 tenant/agent an isolated database under `/db/{name}/…`.
 
-## Built like a database, not a demo
+## Production guarantees
 
-Every claim below is enforced by CI on every push — not asserted, *demonstrated*:
+Every claim below is enforced by CI on every push:
 
 - **Durability** — CRC-framed, versioned, fsynced WAL with single-writer
   locking; a 2xx means it's on disk. Proven by a **kill -9 crash suite**
@@ -106,7 +107,9 @@ Every claim below is enforced by CI on every push — not asserted, *demonstrate
   *product*: recall must reorder around what proved useful, and stay
   deterministic, or CI fails.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.4.0 story.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.4.0 story, and the
+[releases page](https://github.com/GuyShafir/PsyRag/releases) for binaries
+and the Docker image.
 
 ## Documentation
 
