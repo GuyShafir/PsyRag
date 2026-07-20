@@ -78,11 +78,22 @@ class PsyRagClient:
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read().decode())
 
+    def _put_sync(self, path: str, body: dict) -> dict:
+        req = urllib.request.Request(
+            self.base + path, data=json.dumps(body).encode(),
+            headers=self._headers(), method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.loads(r.read().decode())
+
     async def _post(self, path: str, body: dict) -> dict:
         return await asyncio.to_thread(self._post_sync, path, body)
 
     async def _get(self, path: str) -> dict:
         return await asyncio.to_thread(self._get_sync, path)
+
+    async def _put(self, path: str, body: dict) -> dict:
+        return await asyncio.to_thread(self._put_sync, path, body)
 
     # -- API ----------------------------------------------------------------
     async def health(self) -> dict:
@@ -90,6 +101,19 @@ class PsyRagClient:
 
     async def stats(self) -> dict:
         return await self._get("/stats")
+
+    async def get_config(self) -> dict:
+        """Return the database's effective plasticity config as
+        `{"config": {...}, "persistent": bool}`. `persistent` says whether
+        set_config (and quarantine) writes survive restarts via the DB's
+        config.json (multi-DB mode) or apply in-memory only (legacy mode)."""
+        return await self._get("/config")
+
+    async def set_config(self, config: dict) -> dict:
+        """Apply a plasticity config live — no restart. `config` has the same
+        shape as get_config()["config"]; omitted fields take their defaults.
+        Returns `{"applied": true, "persisted": bool}`."""
+        return await self._put("/config", config)
 
     async def ingest(self, entities_json: str, ts: Optional[int] = None,
                      reconcile: bool = False, cai: bool = False,
