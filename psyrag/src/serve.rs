@@ -427,6 +427,7 @@ struct IngestReq {
 }
 #[derive(Deserialize)]
 struct RetrieveReq {
+    #[serde(default)]
     seeds: Vec<String>,
     depth: Option<u32>,
     fan: Option<f32>,
@@ -442,9 +443,33 @@ struct RetrieveReq {
     /// Read-only; allowed under the read scope.
     #[serde(default)]
     explain: bool,
+    /// Semantic seeding: a bring-your-own query embedding. The seed_k
+    /// nearest embedded nodes (cosine) are unioned with `seeds` before
+    /// spreading, and echoed back as `resolved_seeds`.
+    #[serde(default)]
+    seed_vector: Option<Vec<f32>>,
+    #[serde(default = "d_seed_k")]
+    seed_k: usize,
 }
 fn d_match_limit() -> usize {
     16
+}
+fn d_seed_k() -> usize {
+    4
+}
+/// Reject empty/oversized/degenerate query vectors with a 400. (JSON cannot
+/// encode NaN/Infinity, so parsed elements are always finite.)
+fn validate_vector(q: &[f32]) -> Option<Resp> {
+    if q.is_empty() {
+        return Some(err("vector must be non-empty", 400));
+    }
+    if q.len() > 4096 {
+        return Some(err("vector too long (max 4096 dims)", 400));
+    }
+    if q.iter().all(|x| *x == 0.0) {
+        return Some(err("vector must be non-zero", 400));
+    }
+    None
 }
 fn d_topk() -> usize {
     10
@@ -1155,19 +1180,48 @@ fn handle_db(
         (Method::Post, "/match") => {
             #[derive(Deserialize)]
             struct MatchReq {
+                #[serde(default)]
                 tokens: Vec<String>,
                 #[serde(default = "d_match_limit")]
                 limit: usize,
                 /// "token" (default): indexed token-prefix matching,
                 /// O(log N + hits). "substring": legacy full-name substring
-                /// scan, O(nodes) — for mid-token needles.
+                /// scan, O(nodes) — for mid-token needles. "vector": cosine
+                /// top-k over node embeddings (also selected implicitly when
+                /// `vector` is present).
                 #[serde(default)]
                 mode: Option<String>,
+                /// Bring-your-own query embedding for semantic matching
+                /// (must match the dimension used at ingest).
+                #[serde(default)]
+                vector: Option<Vec<f32>>,
             }
             let r: MatchReq = match serde_json::from_str(body) {
                 Ok(r) => r,
                 Err(e) => return err(&format!("bad body: {e}"), 400),
             };
+            // Semantic mode: nearest nodes by cosine over `props.embedding`
+            // vectors. Returns scores alongside the names.
+            if r.vector.is_some() || r.mode.as_deref() == Some("vector") {
+                let Some(q) = r.vector.as_deref() else {
+                    return err("mode \"vector\" needs a `vector` array", 400);
+                };
+                if let Some(resp) = validate_vector(q) {
+                    return resp;
+                }
+                let e = db.engine.read().unwrap();
+                let g = e.pg.graph();
+                let hits = g.match_vector(q, r.limit);
+                let names: Vec<&str> = hits.iter().map(|(id, _)| g.node_name(*id)).collect();
+                let scored: Vec<_> = hits
+                    .iter()
+                    .map(|(id, s)| serde_json::json!({"node": g.node_name(*id), "score": s}))
+                    .collect();
+                return json_resp(
+                    &serde_json::json!({"nodes": names, "hits": scored, "indexed": g.embedding_count()}),
+                    200,
+                );
+            }
             let e = db.engine.read().unwrap();
             let g = e.pg.graph();
             let hits: Vec<String> = match r.mode.as_deref() {
@@ -1209,7 +1263,35 @@ fn handle_db(
                 );
             }
             let ts = r.ts.unwrap_or_else(now_ms);
-            let seeds: Vec<&str> = r.seeds.iter().map(|s| s.as_str()).collect();
+            if let Some(q) = r.seed_vector.as_deref() {
+                if let Some(resp) = validate_vector(q) {
+                    return resp;
+                }
+                if r.seed_k == 0 || r.seed_k > 64 {
+                    return err("seed_k must be in 1..=64", 400);
+                }
+            }
+            // Semantic seeding: resolve the seed_k nearest embedded nodes
+            // and union them with the named seeds (dedup, names first).
+            let semantic =
+                |g: &psyrag_graph::TemporalGraph| -> (Vec<String>, Option<serde_json::Value>) {
+                    let mut all: Vec<String> = r.seeds.clone();
+                    let Some(q) = r.seed_vector.as_deref() else {
+                        return (all, None);
+                    };
+                    let resolved: Vec<_> = g
+                        .match_vector(q, r.seed_k)
+                        .into_iter()
+                        .map(|(id, s)| {
+                            let name = g.node_name(id).to_string();
+                            if !all.contains(&name) {
+                                all.push(name.clone());
+                            }
+                            serde_json::json!({"node": name, "score": s})
+                        })
+                        .collect();
+                    (all, Some(serde_json::Value::Array(resolved)))
+                };
             // Renders a trace's fired edges as the explain payload.
             let explain_json = |g: &psyrag_graph::TemporalGraph, tr: &psyrag_core::Trace| {
                 let fired: Vec<_> = tr
@@ -1229,6 +1311,8 @@ fn handle_db(
                 let e = &mut *guard;
                 let depth = r.depth.unwrap_or(e.layer.cfg.depth);
                 let fan = r.fan.unwrap_or(e.layer.cfg.fan);
+                let (all_seeds, resolved) = semantic(e.pg.graph());
+                let seeds: Vec<&str> = all_seeds.iter().map(|s| s.as_str()).collect();
                 let (mut res, tr) =
                     e.layer
                         .retrieve_traced(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
@@ -1243,32 +1327,58 @@ fn handle_db(
                             if let Some(x) = explain {
                                 body["explain"] = x;
                             }
+                            if let Some(rs) = resolved {
+                                body["resolved_seeds"] = rs;
+                            }
                             json_resp(&body, 200)
                         }
                         Err(msg) => err(&format!("trace not persisted: {msg}"), 500),
                     }
-                } else if let Some(x) = explain {
-                    json_resp(&serde_json::json!({"result": res, "explain": x}), 200)
                 } else {
-                    json_resp(&res, 200)
+                    let mut body = serde_json::json!({"result": res});
+                    let mut wrapped = false;
+                    if let Some(x) = explain {
+                        body["explain"] = x;
+                        wrapped = true;
+                    }
+                    if let Some(rs) = resolved {
+                        body["resolved_seeds"] = rs;
+                        wrapped = true;
+                    }
+                    if wrapped {
+                        json_resp(&body, 200)
+                    } else {
+                        // Wire-compat: a plain retrieval stays a bare result.
+                        json_resp(&body["result"], 200)
+                    }
                 }
             } else {
                 let e = db.engine.read().unwrap();
                 let depth = r.depth.unwrap_or(e.layer.cfg.depth);
                 let fan = r.fan.unwrap_or(e.layer.cfg.fan);
+                let (all_seeds, resolved) = semantic(e.pg.graph());
+                let seeds: Vec<&str> = all_seeds.iter().map(|s| s.as_str()).collect();
                 if r.explain {
                     let (res, tr) =
                         e.layer
                             .retrieve_traced(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
-                    json_resp(
-                        &serde_json::json!({"result": res, "explain": explain_json(e.pg.graph(), &tr)}),
-                        200,
-                    )
+                    let mut body = serde_json::json!({"result": res, "explain": explain_json(e.pg.graph(), &tr)});
+                    if let Some(rs) = resolved {
+                        body["resolved_seeds"] = rs;
+                    }
+                    json_resp(&body, 200)
                 } else {
                     let res = e
                         .layer
                         .retrieve(e.pg.graph(), &seeds, depth, fan, r.top_k, ts);
-                    json_resp(&res, 200)
+                    match resolved {
+                        Some(rs) => json_resp(
+                            &serde_json::json!({"result": res, "resolved_seeds": rs}),
+                            200,
+                        ),
+                        // Wire-compat: a plain retrieval stays a bare result.
+                        None => json_resp(&res, 200),
+                    }
                 }
             }
         }

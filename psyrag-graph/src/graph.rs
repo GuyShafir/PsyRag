@@ -204,7 +204,17 @@ pub struct TemporalGraph {
     /// matching instead of a full-name scan. BTreeMap so token-PREFIX
     /// queries are range scans.
     name_index: BTreeMap<String, Vec<NodeId>>,
+    /// Vector index for semantic seed selection: NodeId -> (embedding, L2
+    /// norm) of the node's CURRENT open version, parsed from the reserved
+    /// `props["embedding"]` key at observation time. Embeddings therefore
+    /// ride the existing ObserveNode op — journaled, replayed, checkpointed
+    /// and purged with no WAL format change. Entries drop when a node is
+    /// retired or re-observed without an embedding.
+    embeddings: HashMap<NodeId, (Box<[f32]>, f32)>,
 }
+
+/// Reserved node-props key carrying a bring-your-own embedding vector.
+pub const EMBEDDING_KEY: &str = "embedding";
 
 /// Lowercase alphanumeric runs of a name, minimum 2 chars: the indexable
 /// tokens. "svc/metering-api" -> ["svc", "metering", "api"].
@@ -418,7 +428,70 @@ impl TemporalGraph {
             props_hash: h,
             props_json: s.into_boxed_str(),
         });
+        self.index_embedding(id, &props);
         id
+    }
+
+    /// Keep the vector index in sync with the node's current version: index
+    /// a valid `props["embedding"]`, drop the entry otherwise. approx_bytes
+    /// only grows (append-only estimate), so replacements add only growth.
+    fn index_embedding(&mut self, id: NodeId, props: &Value) {
+        let parsed: Option<Box<[f32]>> = props.get(EMBEDDING_KEY).and_then(|v| {
+            let arr = v.as_array()?;
+            if arr.is_empty() {
+                return None;
+            }
+            arr.iter()
+                .map(|x| x.as_f64().map(|f| f as f32))
+                .collect::<Option<Box<[f32]>>>()
+        });
+        match parsed {
+            Some(vec) => {
+                let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if !norm.is_finite() || norm <= 0.0 {
+                    self.embeddings.remove(&id);
+                    return;
+                }
+                let old = self.embeddings.get(&id).map_or(0, |(v, _)| v.len());
+                self.approx_bytes +=
+                    4 * vec.len().saturating_sub(old) + if old == 0 { 48 } else { 0 }; // map entry overhead once
+                self.embeddings.insert(id, (vec, norm));
+            }
+            None => {
+                self.embeddings.remove(&id);
+            }
+        }
+    }
+
+    /// Number of nodes currently carrying an embedding.
+    pub fn embedding_count(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    /// Cosine top-k over current-version embeddings: semantic seed
+    /// selection. Bring-your-own vectors (any model, any dimension);
+    /// entries whose dimension differs from the query are skipped.
+    /// Deterministic: ties break by ascending NodeId.
+    pub fn match_vector(&self, query: &[f32], k: usize) -> Vec<(NodeId, f32)> {
+        let qn = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if query.is_empty() || !qn.is_finite() || qn <= 0.0 {
+            return Vec::new();
+        }
+        let mut hits: Vec<(NodeId, f32)> = self
+            .embeddings
+            .iter()
+            .filter_map(|(&id, (v, n))| {
+                if v.len() != query.len() {
+                    return None;
+                }
+                let dot: f32 = v.iter().zip(query).map(|(a, b)| a * b).sum();
+                let sim = dot / (n * qn);
+                sim.is_finite().then_some((id, sim))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        hits.truncate(k);
+        hits
     }
 
     /// Placeholder node: something referenced `name` but we haven't ingested
@@ -458,6 +531,7 @@ impl TemporalGraph {
         if let Some(open) = self.nodes[id as usize].open_version_mut() {
             open.retired_at = ts;
         }
+        self.embeddings.remove(&id);
         let touching: Vec<EdgeId> = self.out_adj[id as usize]
             .iter()
             .chain(self.in_adj[id as usize].iter())
@@ -760,6 +834,94 @@ impl TemporalGraph {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod embeddings {
+    use super::*;
+
+    fn emb(v: &[f32]) -> Value {
+        serde_json::json!({ "embedding": v })
+    }
+
+    #[test]
+    fn index_follows_versions_and_retirement() {
+        let mut g = TemporalGraph::new();
+        let id = g.observe_node("doc", "note", emb(&[1.0, 0.0]), 10);
+        assert_eq!(g.embedding_count(), 1);
+        // re-observe with a new vector: entry replaced, not duplicated
+        g.observe_node("doc", "note", emb(&[0.0, 1.0]), 20);
+        assert_eq!(g.embedding_count(), 1);
+        assert_eq!(g.match_vector(&[0.0, 1.0], 1), vec![(id, 1.0)]);
+        // re-observe WITHOUT an embedding: entry dropped
+        g.observe_node("doc", "note", serde_json::json!({"k": 1}), 30);
+        assert_eq!(g.embedding_count(), 0);
+        // and back, then retirement drops it again
+        g.observe_node("doc", "note", emb(&[1.0, 0.0]), 40);
+        assert_eq!(g.embedding_count(), 1);
+        g.retire_node("doc", 50);
+        assert_eq!(g.embedding_count(), 0);
+        assert!(g.match_vector(&[1.0, 0.0], 4).is_empty());
+    }
+
+    #[test]
+    fn match_vector_ranks_by_cosine_deterministically() {
+        let mut g = TemporalGraph::new();
+        let a = g.observe_node("a", "t", emb(&[1.0, 0.0]), 1);
+        let b = g.observe_node("b", "t", emb(&[0.9, 0.1]), 1);
+        let c = g.observe_node("c", "t", emb(&[0.0, 1.0]), 1);
+        // wrong dimension and junk shapes are skipped, never an error
+        g.observe_node("d3", "t", emb(&[1.0, 0.0, 0.0]), 1);
+        g.observe_node("junk", "t", serde_json::json!({"embedding": "nope"}), 1);
+        g.observe_node("zero", "t", emb(&[0.0, 0.0]), 1);
+        let hits = g.match_vector(&[1.0, 0.0], 10);
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![a, b, c]
+        );
+        assert!(hits[0].1 > hits[1].1 && hits[1].1 > hits[2].1);
+        // exact ties break by ascending NodeId
+        let mut g2 = TemporalGraph::new();
+        let x = g2.observe_node("x", "t", emb(&[1.0, 0.0]), 1);
+        let y = g2.observe_node("y", "t", emb(&[2.0, 0.0]), 1); // same direction
+        let hits = g2.match_vector(&[1.0, 0.0], 2);
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![x, y]
+        );
+    }
+
+    #[test]
+    fn index_survives_op_replay() {
+        let mut g = TemporalGraph::new();
+        g.observe_node("doc", "note", emb(&[0.6, 0.8]), 10);
+        g.observe_node("other", "note", serde_json::json!({}), 10);
+        let ops: Vec<Op> = vec![
+            Op::ObserveNode {
+                name: "doc".into(),
+                asset_type: "note".into(),
+                props: emb(&[0.6, 0.8]),
+                ts: 10,
+                origin: None,
+            },
+            Op::ObserveNode {
+                name: "other".into(),
+                asset_type: "note".into(),
+                props: serde_json::json!({}),
+                ts: 10,
+                origin: None,
+            },
+        ];
+        let mut replayed = TemporalGraph::new();
+        for op in &ops {
+            replayed.apply(op);
+        }
+        assert_eq!(replayed.embedding_count(), g.embedding_count());
+        assert_eq!(
+            replayed.match_vector(&[0.6, 0.8], 1)[0].0,
+            g.match_vector(&[0.6, 0.8], 1)[0].0
+        );
     }
 }
 

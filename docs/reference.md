@@ -250,17 +250,26 @@ scope; `PUT` requires write scope.
 
 ### `POST /ingest`
 `{ "json": "<entities>", "reconcile"?: bool, "cai"?: bool, "ts"?: int }` →
-`{ "edges", "nodes", "stale_retired" }`.
+`{ "edges", "nodes", "stale_retired" }`. A node's `props` may carry a
+reserved `"embedding": [f32, ...]` (bring-your-own vector, any model/dim);
+it is indexed for semantic seed selection and rides the WAL like any other
+property — journaled, replayed, checkpointed, and purged with no format
+change. Re-observing a node without an embedding (or retiring it) drops the
+entry; the vector always reflects the node's current version.
 
 ### `POST /retrieve`
-`{ "seeds": [..], "depth"?, "fan"?, "top_k"?, "ts"?, "adapt"?: bool, "trace"?: bool, "explain"?: bool }`.
-Returns `{ mass, lambda_scale, top: [{node, node_type, activation}] }`. If
-`"trace": true`, returns `{ result, trace_id }` and stores the trace for deferred
-feedback. If `"explain": true`, the response carries
+`{ "seeds"?: [..], "seed_vector"?: [f32], "seed_k"?: int, "depth"?, "fan"?, "top_k"?, "ts"?, "adapt"?: bool, "trace"?: bool, "explain"?: bool }`.
+Returns `{ mass, lambda_scale, top: [{node, node_type, activation, origin}] }`.
+**Semantic seeding**: `seed_vector` (a query embedding) resolves the
+`seed_k` (default 4) nearest embedded nodes by cosine and unions them with
+any named `seeds` before spreading; the chosen entry points are echoed back
+as `resolved_seeds: [{node, score}]`. At least one of `seeds`/`seed_vector`
+is required. If `"trace": true`, returns `{ result, trace_id }` and stores the
+trace for deferred feedback. If `"explain": true`, the response carries
 `explain.fired: [{src, dst, kind, delta}]` — the activation paths, in hop
-order ("why did it recall X"). Explain is read-only and allowed under the
-read scope. Retrieval is deterministic: identical inputs at an identical `ts`
-return identical results (ties break by ingestion order).
+order ("why did it recall X"). Explain and `seed_vector` are read-only and
+allowed under the read scope. Retrieval is deterministic: identical inputs at
+an identical `ts` return identical results (ties break by ingestion order).
 
 ### `POST /match`
 `{ "tokens": [..], "limit"?, "mode"? }` → `{ "nodes": [names] }`. Resolve
@@ -269,6 +278,11 @@ uses an inverted index over name tokens (case-insensitive, token-**prefix**
 matching: `meter` finds `svc/metering-api`) — O(log N + hits), deterministic
 ascending-id order. `"mode": "substring"` restores the legacy full-name
 substring scan (O(nodes)) for mid-token needles.
+**Vector mode**: `{ "vector": [f32], "limit"?, "mode": "vector" }` (mode
+implied when `vector` is present) → `{ "nodes": [names], "hits": [{node,
+score}], "indexed": N }`: cosine top-k over node embeddings, nearest first,
+`indexed` being the number of embedded nodes. Entries whose dimension differs
+from the query are skipped; an empty or zero query vector is a 400.
 
 ### `POST /feedback`
 Provide **one** target and **one** credit spec.

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Semantic seed selection
+- Nodes may carry a reserved `props.embedding` (bring-your-own vector, any
+  model/dimension). It is indexed for cosine search and rides the existing
+  ObserveNode op — journaled, replayed, checkpointed, and purged with no WAL
+  format change; the index always reflects a node's current version.
+- `POST /match` gains a vector mode (`{"vector": [...], "mode": "vector"}`)
+  returning scored nearest nodes. `POST /retrieve` gains `seed_vector` +
+  `seed_k`: the nearest embedded nodes are resolved and unioned with named
+  `seeds` before spreading, and echoed back as `resolved_seeds`. Embeddings
+  pick the entry points; the learned graph does the expansion.
+- Console Retrieve tab gets a "vector" match mode; Python client gains
+  `match_vector()` and `retrieve(seed_vector=, seed_k=)`. `seeds` is now
+  optional on `/retrieve` (semantic-only retrieval).
+
 ## v0.5.0 — 2026-07-19
 
 ### Web console catches up with the server
