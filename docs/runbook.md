@@ -99,18 +99,51 @@ curl -X POST $URL/ingest -d '{"json":"[{\"name\":\"user-42\",\"type\":\"person\"
 curl -X POST $URL/checkpoint -d '{"archive": false}'
 ```
 
-## High availability: the honest position
+## High availability: warm standby (WAL shipping)
 
-PsyRag v1 is deliberately a **single-node** database: one process owns one
-data directory (enforced by the WAL lock). There is no built-in replication
-or failover. The supported posture is:
+Writes are still **single-node** (one process owns one data directory,
+enforced by the WAL lock), but a read-only warm replica is built in:
+
+```bash
+# on the replica host
+psyrag standby --primary http://primary:8080 --primary-token $ADMIN_TOKEN \
+  --wal /data/standby.wal --addr 0.0.0.0:8080 [--follow-db NAME] [--poll-ms 1000]
+```
+
+How it works, and what it guarantees:
+
+- The standby polls `GET /wal/tail/{offset}` and appends the primary's
+  durable WAL bytes to its own log — the local WAL is an exact **byte-copy**,
+  verified on every poll by re-fetching a 64-byte overlap window. Any
+  divergence (primary checkpoint/purge, a swapped primary) is detected and
+  the standby re-replicates from offset 0 automatically.
+- Learned plasticity weights ship too: the standby refreshes the primary's
+  sidecar snapshot every ~5 s, so ranking on the replica stays warm, not
+  just the facts.
+- The standby serves the full read surface (retrieve with
+  `adapt=false`/`trace=false` semantics enforced by 503 on writes, `/graph`,
+  `/stats`, `/match`, the console) and refuses every write with 503.
+- **RPO**: facts acked by the primary up to one poll interval before failure
+  (default 1 s); learned weights up to the sidecar cadence (~5 s). **RTO**:
+  the standby is already serving reads; write failover = restart it as a
+  normal primary.
+- **Failover** (manual, deliberately): stop the standby process and start a
+  regular `psyrag serve` on the same `--wal`. The replicated log replays and
+  the promoted node accepts writes. Ensure the old primary stays down
+  (fencing is the operator's job — there is no automatic leader election).
+- The replication endpoints (`/wal/tail`, `/wal/sidecar`) expose raw facts
+  and are denied to read-only tokens; give the standby a full or db-scoped
+  token via `--primary-token`.
+
+`scripts/standby.sh` drills the whole lifecycle in CI: replicate, read-only
+enforcement, weight shipping, checkpoint resync, primary kill, promote,
+zero acked-write loss.
+
+Remaining posture for anything beyond one warm replica:
 
 - fast restart (systemd/K8s restart policy) + small working logs = RTO in
   seconds;
 - backups + the drill above = disaster recovery;
-- **warm standby (roadmap)**: the append-only, name-addressed WAL is
-  shipping-friendly — tail the log to a standby that replays continuously
-  and takes over read-only. Not implemented; listed in TODO.
 - **managed-backend tier (roadmap)**: the `GraphBackend` seam
   (`psyrag_core::backend`) is real, compilable, and conformance-tested
   against the in-memory reference; a Spanner/AlloyDB implementation moves

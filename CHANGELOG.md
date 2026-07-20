@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### WAL-shipping warm standby
+- New `psyrag standby --primary URL` mode: a read-only warm replica that
+  tails the primary's WAL over HTTP (`GET /wal/tail/{offset}`) into an exact
+  local byte-copy, verified by a 64-byte overlap window on every poll —
+  checkpoint/purge rewrites (or a swapped primary) are detected and trigger
+  an automatic full resync. Learned plasticity weights ship too via periodic
+  sidecar snapshots (`GET /wal/sidecar`), so ranking stays warm on the
+  replica, not just facts.
+- The standby serves the full read surface and refuses writes with 503.
+  Failover is a deliberate manual promote: restart the same WAL under
+  `psyrag serve`. RPO: facts ≤ one poll interval (default 1 s), weights ≤
+  sidecar cadence (~5 s); RTO: reads are already up, writes = one restart.
+- Replication endpoints are denied to read-only tokens. `scripts/standby.sh`
+  drills the full lifecycle (replicate → read-only → weight shipping →
+  checkpoint resync → primary kill → promote, zero acked-write loss) in CI.
+
 ## v0.5.0 — 2026-07-19
 
 ### Web console catches up with the server

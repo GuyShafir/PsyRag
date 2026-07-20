@@ -26,6 +26,8 @@ jobs:
         run: bash scripts/smoke.sh
       - name: kill -9 crash-recovery suite (acked-write durability)
         run: bash scripts/crash.sh 5
+      - name: warm-standby replication + failover drill
+        run: bash scripts/standby.sh
       - name: load/soak with SLO assertions (from Prometheus histograms)
         run: bash scripts/load.sh 15 8
 
