@@ -113,7 +113,7 @@
   <section id="retr" class="tab">
     <div class="row">
       <input id="msearch" placeholder="find seeds… (node name tokens)" style="min-width:200px"/>
-      <select id="mmode" title="token: indexed prefix · substring: full scan"><option value="token">token</option><option value="substring">substring</option></select>
+      <select id="mmode" title="token: indexed prefix · substring: full scan · vector: cosine over embeddings (paste a [.,.] vector)"><option value="token">token</option><option value="substring">substring</option><option value="vector">vector</option></select>
       <button class="ghost" onclick="doMatch()">match</button>
       <span id="mhits" class="row" style="margin:0"></span>
     </div>
@@ -408,10 +408,24 @@ async function loadGraph(force){
 // ---------- match ----------
 async function doMatch(){
   const q=$('#msearch').value.trim(); if(!q)return;
+  const mode=$('#mmode').value;
+  let body;
+  if(mode==='vector'){
+    let vec; try{vec=JSON.parse(q)}catch(e){vec=q.split(/[\s,]+/).filter(Boolean).map(Number)}
+    if(!Array.isArray(vec)||!vec.length||vec.some(x=>typeof x!=='number'||!isFinite(x))){
+      $('#mhits').innerHTML='<span class="muted">paste a query vector, e.g. [0.1, -0.4, 0.2]</span>';return;
+    }
+    body={vector:vec,limit:16,mode:'vector'};
+  } else {
+    body={tokens:q.split(/[\s,]+/).filter(Boolean),limit:16,mode};
+  }
   try{
-    const r=await post('/match',{tokens:q.split(/[\s,]+/).filter(Boolean),limit:16,mode:$('#mmode').value});
-    $('#mhits').innerHTML=(r.nodes&&r.nodes.length)
-      ? r.nodes.map(n=>`<span class="pill click" onclick="addSeed('${esc(n).replace(/'/g,"\\'")}')" title="add as seed">${esc(n)}</span>`).join('')
+    const r=await post('/match',body);
+    // vector mode returns scored hits; name modes return bare names
+    const items=(r.hits&&r.hits.length)?r.hits.map(h=>[h.node,h.score])
+      :(r.nodes||[]).map(n=>[n,null]);
+    $('#mhits').innerHTML=items.length
+      ? items.map(([n,s])=>`<span class="pill click" onclick="addSeed('${esc(n).replace(/'/g,"\\'")}')" title="add as seed">${esc(n)}${s!=null?` <span class="muted">${s.toFixed(3)}</span>`:''}</span>`).join('')
       : '<span class="muted">no matches</span>';
   }catch(e){fail(e,'match')}
 }

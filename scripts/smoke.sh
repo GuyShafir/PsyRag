@@ -272,6 +272,37 @@ C=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$AT" "$SURL/db/tenant-a/f
 [ "$C" = "429" ] && ok "feedback rate limit -> 429" || no "rate limit missing ($C)"
 kill $SSRV 2>/dev/null; wait $SSRV 2>/dev/null
 
+echo "== 19. semantic seed selection (embeddings) =="
+VPORT=$((PORT+8)); VURL="http://127.0.0.1:${VPORT}"
+"$BIN" --data-dir "$WORK/vec" serve --addr "127.0.0.1:${VPORT}" >"$WORK/serve-v.log" 2>&1 &
+VSRV=$!; sleep 1.5
+# three nodes with 2-D embeddings pointing in distinct directions
+curl -s -X POST "$VURL/ingest" -H 'Content-Type: application/json' -d '{"json":"[{\"name\":\"east\",\"type\":\"doc\",\"props\":{\"embedding\":[1.0,0.0]}},{\"name\":\"north\",\"type\":\"doc\",\"props\":{\"embedding\":[0.0,1.0]}},{\"name\":\"nearby\",\"type\":\"doc\",\"props\":{\"embedding\":[0.9,0.1]}}]","ts":1000}' >/dev/null
+# vector /match: a query near "east" ranks east first, nearby second, north last
+M=$(curl -s -X POST "$VURL/match" -d '{"vector":[1.0,0.0],"limit":3}')
+FIRST=$(echo "$M" | j 'd["nodes"][0]'); IDX=$(echo "$M" | j 'd["indexed"]')
+[ "$FIRST" = "east" ] && ok "vector match ranks nearest first" || no "vector match wrong order ($FIRST)"
+[ "$IDX" = "3" ] && ok "match reports 3 indexed embeddings" || no "wrong indexed count ($IDX)"
+# scored hits present and descending
+DESC=$(echo "$M" | python3 -c 'import sys,json;h=json.load(sys.stdin)["hits"];print("ok" if h[0]["score"]>=h[1]["score"]>=h[2]["score"] else "no")')
+[ "$DESC" = "ok" ] && ok "vector match scores descending" || no "scores not sorted"
+# semantic retrieve: seed_vector resolves seeds and echoes resolved_seeds
+R=$(curl -s -X POST "$VURL/retrieve" -d '{"seed_vector":[1.0,0.0],"seed_k":1,"adapt":false}')
+RS=$(echo "$R" | j 'd["resolved_seeds"][0]["node"]')
+TOP=$(echo "$R" | j 'd["result"]["top"][0]["node"]')
+[ "$RS" = "east" ] && ok "retrieve resolves seed_vector -> east" || no "seed_vector resolution wrong ($RS)"
+[ "$TOP" = "east" ] && ok "semantic retrieval surfaces the resolved seed" || no "no surfaced node ($TOP)"
+# empty/zero vector rejected
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$VURL/match" -d '{"vector":[0.0,0.0],"limit":3}')
+[ "$C" = "400" ] && ok "zero query vector -> 400" || no "zero vector not rejected ($C)"
+# embedding survives restart (rides the WAL) and updates on re-observe
+kill $VSRV 2>/dev/null; wait $VSRV 2>/dev/null
+"$BIN" --data-dir "$WORK/vec" serve --addr "127.0.0.1:${VPORT}" >"$WORK/serve-v2.log" 2>&1 &
+VSRV=$!; sleep 1.5
+M=$(curl -s -X POST "$VURL/match" -d '{"vector":[1.0,0.0],"limit":1}')
+[ "$(echo "$M" | j 'd["indexed"]')" = "3" ] && ok "embeddings survive restart (WAL replay)" || no "embeddings lost on restart"
+kill $VSRV 2>/dev/null; wait $VSRV 2>/dev/null
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]
