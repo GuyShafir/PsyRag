@@ -24,6 +24,7 @@
 //!         --data-dir DIR  --db NAME     (multi-database layout)
 
 mod args;
+mod client;
 mod config;
 mod engine;
 mod export;
@@ -41,7 +42,9 @@ use std::path::Path;
 
 const USAGE: &str = "psyrag <command> [flags]
 commands: config ingest retrieve touch feedback consolidate sleep stats
-          checkpoint verify backup purge export-bq db serve monitor
+          checkpoint verify backup purge export-bq db serve standby monitor
+standby:  --primary URL [--primary-token T] [--follow-db NAME] [--poll-ms N]
+          --wal PATH --addr HOST:PORT   (read-only warm replica of a primary)
 global:   --wal PATH  --sidecar PATH  --config PATH.json  --data-dir DIR  --db NAME
 run `psyrag config` to see all tunables.";
 
@@ -540,6 +543,67 @@ fn dispatch(a: &Args) -> Result<(), String> {
                 max_credit: a.get_f32("max-credit").unwrap_or(100.0),
                 max_feedback_per_min: a.get_u32("max-feedback-per-min").unwrap_or(0),
                 ephemeral_traces: a.has("ephemeral-traces"),
+                standby: None,
+            };
+            serve::run(opts)?;
+        }
+        Some("standby") => {
+            // Read-only warm standby: follow a primary's WAL, serve reads.
+            let cfg = config::load(a.get("config"))?;
+            let addr = a.get_or("addr", "127.0.0.1:8080").to_string();
+            let wal = a.get_or("wal", "psyrag-standby.wal").to_string();
+            let sidecar = a
+                .get("sidecar")
+                .map(String::from)
+                .unwrap_or_else(|| format!("{wal}.psyrag.json"));
+            match a.get_or("log-format", "text") {
+                "json" => log::set_format(log::Format::Json),
+                "text" => log::set_format(log::Format::Text),
+                other => return Err(format!("bad --log-format '{other}' (want json|text)")),
+            }
+            let primary_url = a
+                .get("primary")
+                .ok_or("standby needs --primary URL (e.g. http://primary:8080)")?
+                .to_string();
+            let poll_ms = a.get_usize("poll-ms").unwrap_or(1000).max(100) as u64;
+            let opts = serve::ServeOpts {
+                addr,
+                data_dir: None,
+                wal,
+                sidecar,
+                cfg,
+                token: a
+                    .get("token")
+                    .map(String::from)
+                    .or_else(|| std::env::var("PSYRAG_TOKEN").ok()),
+                read_token: a
+                    .get("read-token")
+                    .map(String::from)
+                    .or_else(|| std::env::var("PSYRAG_READ_TOKEN").ok()),
+                db_tokens: std::collections::HashMap::new(),
+                max_body: a.get_usize("max-body-mb").unwrap_or(32) * 1024 * 1024,
+                workers: a.get_usize("workers").unwrap_or(4).max(1),
+                max_open_dbs: 64,
+                sleep_every: None,
+                consolidate_every: None,
+                checkpoint_every: None,
+                max_db_bytes: 0,
+                max_db_edges: 0,
+                max_mem_bytes: 0,
+                max_credit: 100.0,
+                max_feedback_per_min: 0,
+                ephemeral_traces: false,
+                standby: Some(serve::StandbyOpts {
+                    primary_url,
+                    // The standby authenticates to the primary with its own
+                    // token (write/admin scope on the primary's /wal/*).
+                    token: a
+                        .get("primary-token")
+                        .map(String::from)
+                        .or_else(|| std::env::var("PSYRAG_PRIMARY_TOKEN").ok()),
+                    db: a.get_or("follow-db", "default").to_string(),
+                    poll: std::time::Duration::from_millis(poll_ms),
+                }),
             };
             serve::run(opts)?;
         }

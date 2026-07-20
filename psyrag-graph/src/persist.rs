@@ -666,6 +666,101 @@ impl PersistentGraph {
         self.wal.get_ref().sync_data().map_err(|e| e.to_string())
     }
 
+    // -- WAL shipping (replication) -----------------------------------------
+    // The WAL is an append-only byte stream, so a follower can replicate it by
+    // fetching new bytes since its last offset and applying them. Byte offsets
+    // are the sync unit; they reset on compaction (a full rewrite), which the
+    // follower detects via a changed wal_id or a shorter primary length.
+
+    /// Durable (flushed) byte length of the WAL — the high-water mark a
+    /// follower may safely replicate up to. Flushes first so the returned
+    /// length only ever covers fsynced bytes.
+    pub fn durable_len(&mut self) -> Result<u64, String> {
+        self.flush()?;
+        std::fs::metadata(&self.path)
+            .map(|m| m.len())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Read raw WAL bytes in `[from, durable_end)` for shipping to a
+    /// follower. `from` past the durable end yields an empty slice (the
+    /// follower is caught up); `from` past the FILE end signals a rewind
+    /// (compaction) — the follower should resync from 0.
+    pub fn read_wal_range(&mut self, from: u64) -> Result<Vec<u8>, String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let end = self.durable_len()?;
+        if from >= end {
+            return Ok(Vec::new());
+        }
+        let mut f = File::open(&self.path).map_err(|e| e.to_string())?;
+        f.seek(SeekFrom::Start(from)).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; (end - from) as usize];
+        f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        Ok(buf)
+    }
+
+    /// Apply a shipped WAL byte range on a follower: verify each framed
+    /// record, append it verbatim to the local WAL, and apply the op to the
+    /// in-memory graph. `bytes` must begin on a record boundary (the caller
+    /// tracks byte offsets). Returns the number of ops applied. Fsyncs on
+    /// success so a replicated batch is as durable on the follower as on the
+    /// primary. A corrupt record aborts without partial local commit.
+    pub fn apply_shipped(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let text =
+            std::str::from_utf8(bytes).map_err(|e| format!("shipped bytes not utf-8: {e}"))?;
+        let mut ops = Vec::new();
+        for line in text.split_inclusive('\n') {
+            let content = line.trim_end_matches(['\n', '\r']);
+            if content.trim().is_empty() {
+                continue;
+            }
+            match parse_line(content)? {
+                Parsed::Header => {
+                    if self.wal_id.is_none() {
+                        self.wal_id = parse_header_id(content);
+                    }
+                }
+                Parsed::Record(op) => ops.push(op),
+            }
+        }
+        // Write the shipped bytes verbatim (preserves exact framing/offsets),
+        // then apply ops to memory and fsync.
+        self.wal.write_all(bytes).map_err(|e| e.to_string())?;
+        let applied = ops.len();
+        for op in ops {
+            self.graph.apply(&op);
+            self.lsn += 1;
+        }
+        self.flush()?;
+        Ok(applied)
+    }
+
+    /// Discard the local WAL and in-memory state entirely, to re-replicate a
+    /// primary from offset 0. Used when the follower detects the primary's
+    /// log was rewritten (compaction): a changed wal_id or a length shorter
+    /// than the follower's offset.
+    pub fn reset_for_resync(&mut self) -> Result<(), String> {
+        self.wal.flush().map_err(|e| e.to_string())?;
+        let f = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| e.to_string())?;
+        f.set_len(0).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        // Reopen the append handle at the now-empty file.
+        self.wal = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|e| e.to_string())?,
+        );
+        self.graph = TemporalGraph::new();
+        self.wal_id = None;
+        self.lsn = 0;
+        Ok(())
+    }
+
     /// Ingest generic entities observed at `ts`. With `reconcile`, the input
     /// is a full domain snapshot (zombie + edge reconciliation applied).
     pub fn ingest_entities(

@@ -80,6 +80,22 @@ pub struct ServeOpts {
     /// Keep retrieval traces in memory only (nothing trace-derived touches
     /// disk; deferred credit then does not survive restarts).
     pub ephemeral_traces: bool,
+    /// When set, this process is a read-only warm standby following a
+    /// primary: it tails the primary's WAL, serves reads, and refuses writes.
+    pub standby: Option<StandbyOpts>,
+}
+
+/// Configuration for read-only standby (follower) mode.
+#[derive(Clone)]
+pub struct StandbyOpts {
+    /// Primary base URL, e.g. `http://primary:8080`.
+    pub primary_url: String,
+    /// Bearer token for the primary (needs write/admin scope for /wal/*).
+    pub token: Option<String>,
+    /// Which primary database to follow (default DB unless set).
+    pub db: String,
+    /// Poll interval between WAL fetches.
+    pub poll: Duration,
 }
 
 #[derive(Clone, PartialEq)]
@@ -521,6 +537,10 @@ fn json_resp<T: serde::Serialize>(v: &T, code: u16) -> Resp {
 fn err(msg: &str, code: u16) -> Resp {
     json_resp(&serde_json::json!({ "error": msg }), code)
 }
+/// Parse a `Name: value` header (infallible for our literal inputs).
+fn hdr(s: &str) -> tiny_http::Header {
+    s.parse::<tiny_http::Header>().unwrap()
+}
 fn html(body: &str) -> Resp {
     Response::from_string(body)
         .with_status_code(200)
@@ -598,13 +618,26 @@ pub fn run(opts: ServeOpts) -> Result<(), String> {
         }),
     );
     // Console-friendly one-liner regardless of log format.
-    eprintln!("psyrag serve on http://{addr}");
+    if let Some(sb) = &reg.opts.standby {
+        eprintln!(
+            "psyrag standby on http://{addr} (read-only, following {} db={})",
+            sb.primary_url, sb.db
+        );
+    } else {
+        eprintln!("psyrag serve on http://{addr}");
+    }
 
-    // Built-in maintenance: one scheduler thread runs due tasks against
-    // every open, non-wedged database (write lock per db per task).
+    // A standby follows the primary's WAL instead of running maintenance
+    // (maintenance rewrites the log — a follower must never mutate its own).
     let maintenance = {
         let reg = reg.clone();
-        std::thread::spawn(move || maintenance_loop(&reg))
+        std::thread::spawn(move || {
+            if reg.opts.standby.is_some() {
+                follower_loop(&reg);
+            } else {
+                maintenance_loop(&reg);
+            }
+        })
     };
 
     let mut handles = Vec::new();
@@ -724,6 +757,174 @@ fn maintenance_loop(reg: &Arc<Registry>) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Standby follower: tail the primary's WAL into the local default DB and
+/// keep the plasticity sidecar warm. One thread; holds the DB write lock only
+/// for the brief apply, so reads stay concurrent. Resilient to a primary
+/// that is briefly down (logs and retries) and to primary compaction
+/// (resyncs from offset 0).
+fn follower_loop(reg: &Arc<Registry>) {
+    let sb = reg
+        .opts
+        .standby
+        .clone()
+        .expect("follower without standby opts");
+    let db = match reg.resolve(DEFAULT_DB, true) {
+        Ok(db) => db,
+        Err((_, m)) => {
+            log::error("standby_open_failed", serde_json::json!({"error": m}));
+            return;
+        }
+    };
+    let base = sb.primary_url.trim_end_matches('/');
+    let prefix = if sb.db == DEFAULT_DB {
+        String::new()
+    } else {
+        format!("/db/{}", sb.db)
+    };
+    let timeout = Duration::from_secs(10);
+    // Sidecar is refetched at most this often (cheaper cadence than the WAL:
+    // it is a full snapshot, and stale weights only affect ranking, not truth).
+    let sidecar_every = Duration::from_secs(5);
+    let mut last_sidecar = Instant::now()
+        .checked_sub(sidecar_every)
+        .unwrap_or_else(Instant::now);
+    let mut caught_up_logged = false;
+
+    // Byte-overlap window verified on every poll: the standby re-fetches its
+    // last N local bytes and compares. Any divergence — a freshly-created
+    // local header, primary compaction/purge, a different primary entirely —
+    // shows up as a byte mismatch and forces a clean resync from offset 0.
+    // The local WAL is therefore always an exact byte-copy of the primary's.
+    const OVERLAP: u64 = 64;
+
+    while !STOP.load(Ordering::SeqCst) {
+        // (request offset, expected overlap bytes at that offset)
+        let (from, expected) = {
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            let len = e.pg.durable_len().unwrap_or(0);
+            let ov = len.min(OVERLAP);
+            let bytes = if ov > 0 {
+                e.pg.read_wal_range(len - ov).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (len - ov, bytes)
+        };
+        let url = format!("{base}{prefix}/wal/tail/{from}");
+        let mut resync = false;
+        match crate::client::get(&url, sb.token.as_deref(), timeout) {
+            Ok(resp) if resp.status == 200 => {
+                if resp.body.len() < expected.len() || resp.body[..expected.len()] != expected[..] {
+                    resync = true;
+                } else {
+                    let new = &resp.body[expected.len()..];
+                    let applied = if new.is_empty() {
+                        Ok(0)
+                    } else {
+                        let mut guard = db.engine.write().unwrap();
+                        let e = &mut *guard;
+                        let r = e.pg.apply_shipped(new);
+                        if r.is_ok() {
+                            e.layer.sync(e.pg.graph());
+                        }
+                        r
+                    };
+                    match applied {
+                        Ok(n) if n > 0 => {
+                            caught_up_logged = false;
+                            log::info(
+                                "standby_apply",
+                                serde_json::json!({"from": from, "ops": n, "bytes": new.len()}),
+                            );
+                        }
+                        Ok(_) => {
+                            if !caught_up_logged {
+                                log::info(
+                                    "standby_caught_up",
+                                    serde_json::json!({"offset": from + expected.len() as u64}),
+                                );
+                                caught_up_logged = true;
+                            }
+                        }
+                        Err(m) => {
+                            log::error("standby_apply_failed", serde_json::json!({"error": m}))
+                        }
+                    }
+                }
+            }
+            // Offset past the primary's end: its log shrank (rewrite).
+            Ok(resp) if resp.status == 409 => resync = true,
+            Ok(resp) => log::error(
+                "standby_fetch_status",
+                serde_json::json!({"status": resp.status, "url": url}),
+            ),
+            Err(m) => log::warn(
+                "standby_fetch_failed",
+                serde_json::json!({"error": m, "primary": base}),
+            ),
+        }
+        if resync {
+            log::warn(
+                "standby_resync",
+                serde_json::json!({"reason": "primary log diverged/rewritten; re-replicating from 0"}),
+            );
+            let mut guard = db.engine.write().unwrap();
+            let e = &mut *guard;
+            if let Err(m) = e.pg.reset_for_resync() {
+                log::error("standby_resync_failed", serde_json::json!({"error": m}));
+            } else {
+                // Fresh graph => fresh sidecar columns (EdgeIds renumber from
+                // 0); learned weights re-ship on the next sidecar refresh.
+                e.layer = PlasticityLayer::new(e.layer.cfg.clone());
+            }
+            // Skip the poll sleep: refetch immediately from offset 0.
+            continue;
+        }
+
+        // Periodically refresh learned weights from the primary's sidecar.
+        if last_sidecar.elapsed() >= sidecar_every {
+            last_sidecar = Instant::now();
+            let url = format!("{base}{prefix}/wal/sidecar");
+            match crate::client::get(&url, sb.token.as_deref(), timeout) {
+                Ok(resp) if resp.status == 200 && !resp.body.is_empty() => {
+                    let mut guard = db.engine.write().unwrap();
+                    let e = &mut *guard;
+                    let path = e.sidecar_path.clone();
+                    let tmp = format!("{path}.repl.tmp");
+                    let wrote =
+                        std::fs::write(&tmp, &resp.body).and_then(|_| std::fs::rename(&tmp, &path));
+                    match wrote {
+                        Ok(()) => {
+                            // Bind to the local WAL id so load's lineage check
+                            // passes (the local WAL is a byte-copy of the
+                            // primary's, so the ids match). Disjoint field
+                            // borrows: layer mutably, pg's graph immutably.
+                            let id = e.pg.wal_id().map(|s| s.to_string());
+                            let lsn = e.pg.lsn();
+                            e.layer.set_wal_binding(id.as_deref(), lsn);
+                            if let Err(m) = e.layer.load_if_exists(e.pg.graph(), &path) {
+                                log::warn("standby_sidecar_load", serde_json::json!({"error": m}));
+                            }
+                        }
+                        Err(er) => log::warn(
+                            "standby_sidecar_write",
+                            serde_json::json!({"error": er.to_string()}),
+                        ),
+                    }
+                }
+                _ => {} // 204/absent/unreachable — keep current weights
+            }
+        }
+
+        // Sleep in short ticks so shutdown stays responsive.
+        let deadline = Instant::now() + sb.poll;
+        while Instant::now() < deadline && !STOP.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100).min(sb.poll));
         }
     }
 }
@@ -1177,6 +1378,65 @@ fn handle_db(
             let e = db.engine.read().unwrap();
             json_resp(&e.layer.stats(e.pg.graph()), 200)
         }
+        // -- WAL shipping (replication source) ------------------------------
+        // A follower pulls durable WAL bytes from an offset (path segment) to
+        // stay warm. Exposes raw facts, so Read scope is not enough.
+        (m, p) if *m == Method::Get && p.starts_with("/wal/tail/") => {
+            if scope == Scope::Read {
+                return err("replication requires write/admin scope", 403);
+            }
+            let Some(from) = p.trim_start_matches("/wal/tail/").parse::<u64>().ok() else {
+                return err("bad offset in /wal/tail/<from>", 400);
+            };
+            let mut e = db.engine.write().unwrap();
+            let (wal_id, len, bytes) = {
+                let len = match e.pg.durable_len() {
+                    Ok(l) => l,
+                    Err(m) => return err(&format!("wal length: {m}"), 500),
+                };
+                // Rewound below the follower's offset => compaction; tell it
+                // to resync from 0 via a 409.
+                if from > len {
+                    let id = e.pg.wal_id().unwrap_or("").to_string();
+                    return Response::from_string(
+                        serde_json::json!({"error": "offset past end (log was rewritten); resync from 0", "wal_len": len}).to_string(),
+                    )
+                    .with_status_code(409)
+                    .with_header(hdr(&format!("X-PsyRag-Wal-Id: {id}")))
+                    .with_header(hdr(&format!("X-PsyRag-Wal-Len: {len}")))
+                    .with_header(hdr("Content-Type: application/json"));
+                }
+                let bytes = match e.pg.read_wal_range(from) {
+                    Ok(b) => b,
+                    Err(m) => return err(&format!("wal read: {m}"), 500),
+                };
+                (e.pg.wal_id().unwrap_or("").to_string(), len, bytes)
+            };
+            Response::from_data(bytes)
+                .with_status_code(200)
+                .with_header(hdr(&format!("X-PsyRag-Wal-Id: {wal_id}")))
+                .with_header(hdr(&format!("X-PsyRag-Wal-Len: {len}")))
+                .with_header(hdr("Content-Type: application/octet-stream"))
+        }
+        // Learned plasticity weights are not journaled; a follower fetches the
+        // sidecar snapshot to stay warm on salience too (as-of its LSN).
+        (Method::Get, "/wal/sidecar") => {
+            if scope == Scope::Read {
+                return err("replication requires write/admin scope", 403);
+            }
+            let mut e = db.engine.write().unwrap();
+            // Snapshot current learned state so the follower gets the latest.
+            if let Err(m) = e.save_sidecar() {
+                return err(&format!("sidecar snapshot: {m}"), 500);
+            }
+            match std::fs::read(&e.sidecar_path) {
+                Ok(bytes) => Response::from_data(bytes)
+                    .with_status_code(200)
+                    .with_header(hdr("Content-Type: application/json")),
+                // No sidecar yet (nothing learned) — an empty 204 is not an error.
+                Err(_) => Response::from_string("").with_status_code(204),
+            }
+        }
         (Method::Post, "/match") => {
             #[derive(Deserialize)]
             struct MatchReq {
@@ -1386,6 +1646,18 @@ fn handle_db(
             // Everything below mutates the database.
             if !scope.can_write() {
                 return err("write scope required", 403);
+            }
+            // A read-only standby owns no truth of its own: all mutation must
+            // go to the primary it follows (its own writes would diverge from
+            // the replicated log).
+            if let Some(sb) = &reg.opts.standby {
+                return err(
+                    &format!(
+                        "read-only standby following {}; send writes to the primary",
+                        sb.primary_url
+                    ),
+                    503,
+                );
             }
             // A wedged database (WAL write failed after in-memory apply)
             // refuses writes; reads above keep serving.

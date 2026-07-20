@@ -236,6 +236,16 @@ The web console (HTML). See [integrations.md](integrations.md).
 Sidecar + graph stats: `nodes`, `edges_total`, `edges_live`, `edges_dead`,
 `lambda_scale`, `setpoint`, `ewma_mass`, `integral`, `weight_min/mean/max`.
 
+### `GET /wal/tail/{offset}` and `GET /wal/sidecar`
+Replication source for the warm standby (`psyrag standby`). `tail` returns
+the durable (fsynced) WAL bytes from `offset` with `X-PsyRag-Wal-Id` /
+`X-PsyRag-Wal-Len` headers; an offset past the end (log rewritten by
+checkpoint/purge) is a 409 telling the follower to resync from 0.
+`sidecar` snapshots and returns the current learned-weights file (204 if
+nothing learned yet). Both expose raw facts and are **denied to read-only
+tokens**. You normally never call these by hand — see the standby section
+of the [runbook](runbook.md).
+
 ### `GET /config` and `PUT /config`
 `GET` returns `{ config, persistent }` — the database's effective plasticity
 config and whether edits persist (`true` in multi-DB mode, where they are
