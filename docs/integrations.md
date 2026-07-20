@@ -13,9 +13,10 @@ token, type the database name directly). Tabs are deep-linkable (`/ui#trust`):
   and the wedged flag. Auto-refreshes.
 - **Graph** — force-directed view of the graph; edge width = current
   (trust-masked) weight, faded = retired. Click a node to make it a seed.
-- **Retrieve** — seed search via `POST /match` (indexed token-prefix or
-  substring), full retrieval controls (depth / fan / top-k / ts / adapt /
-  trace / explain), the fired-edge **explain table**, and the trace subgraph
+- **Retrieve** — seed search via `POST /match` (indexed token-prefix,
+  substring, or **vector** — cosine over node embeddings, paste a query
+  vector), full retrieval controls (depth / fan / top-k / ts / adapt / trace /
+  explain), the fired-edge **explain table**, and the trace subgraph
   visualization. Feedback in all three modes: mark-as-used, per-node graded
   scores, or episodic reward. Under a read-only token retrieval automatically
   drops `adapt`/`trace`.

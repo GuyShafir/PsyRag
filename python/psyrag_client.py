@@ -78,11 +78,22 @@ class PsyRagClient:
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read().decode())
 
+    def _put_sync(self, path: str, body: dict) -> dict:
+        req = urllib.request.Request(
+            self.base + path, data=json.dumps(body).encode(),
+            headers=self._headers(), method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.loads(r.read().decode())
+
     async def _post(self, path: str, body: dict) -> dict:
         return await asyncio.to_thread(self._post_sync, path, body)
 
     async def _get(self, path: str) -> dict:
         return await asyncio.to_thread(self._get_sync, path)
+
+    async def _put(self, path: str, body: dict) -> dict:
+        return await asyncio.to_thread(self._put_sync, path, body)
 
     # -- API ----------------------------------------------------------------
     async def health(self) -> dict:
@@ -90,6 +101,19 @@ class PsyRagClient:
 
     async def stats(self) -> dict:
         return await self._get("/stats")
+
+    async def get_config(self) -> dict:
+        """Return the database's effective plasticity config as
+        `{"config": {...}, "persistent": bool}`. `persistent` says whether
+        set_config (and quarantine) writes survive restarts via the DB's
+        config.json (multi-DB mode) or apply in-memory only (legacy mode)."""
+        return await self._get("/config")
+
+    async def set_config(self, config: dict) -> dict:
+        """Apply a plasticity config live — no restart. `config` has the same
+        shape as get_config()["config"]; omitted fields take their defaults.
+        Returns `{"applied": true, "persisted": bool}`."""
+        return await self._put("/config", config)
 
     async def ingest(self, entities_json: str, ts: Optional[int] = None,
                      reconcile: bool = False, cai: bool = False,
@@ -104,14 +128,25 @@ class PsyRagClient:
             body["origin"] = origin
         return await self._post_idem("/ingest", body)
 
-    async def retrieve(self, seeds: list[str], depth: Optional[int] = None,
+    async def retrieve(self, seeds: Optional[list[str]] = None,
+                       depth: Optional[int] = None,
                        top_k: int = 10, ts: Optional[int] = None,
-                       adapt: bool = False, trace: bool = False) -> dict:
-        body: dict[str, Any] = {"seeds": seeds, "top_k": top_k, "adapt": adapt, "trace": trace}
+                       adapt: bool = False, trace: bool = False,
+                       seed_vector: Optional[list[float]] = None,
+                       seed_k: int = 4) -> dict:
+        """Spreading-activation retrieval. Seed by name (`seeds`) and/or
+        semantically (`seed_vector`: a query embedding whose `seed_k` nearest
+        embedded nodes are unioned with the named seeds and echoed back under
+        `resolved_seeds`)."""
+        body: dict[str, Any] = {"seeds": seeds or [], "top_k": top_k,
+                                "adapt": adapt, "trace": trace}
         if depth is not None:
             body["depth"] = depth
         if ts is not None:
             body["ts"] = ts
+        if seed_vector is not None:
+            body["seed_vector"] = seed_vector
+            body["seed_k"] = seed_k
         return await self._post("/retrieve", body)
 
     async def feedback(self, *, seeds: Optional[list[str]] = None,
@@ -149,10 +184,22 @@ class PsyRagClient:
             body["ts"] = ts
         return await self._post_idem("/consolidate", body)
 
-    async def match_nodes(self, tokens: list[str], limit: int = 16) -> list[str]:
-        """Resolve free-text tokens to existing node names (substring, case-insensitive)."""
-        r = await self._post("/match", {"tokens": tokens, "limit": limit})
+    async def match_nodes(self, tokens: list[str], limit: int = 16,
+                          mode: Optional[str] = None) -> list[str]:
+        """Resolve free-text tokens to existing node names. Default mode is
+        indexed token-prefix matching; pass mode="substring" for a full scan."""
+        body: dict[str, Any] = {"tokens": tokens, "limit": limit}
+        if mode is not None:
+            body["mode"] = mode
+        r = await self._post("/match", body)
         return r.get("nodes", [])
+
+    async def match_vector(self, vector: list[float], limit: int = 16) -> list[dict]:
+        """Semantic node lookup: cosine top-k over node embeddings (the
+        reserved `props.embedding` set at ingest). Returns scored hits
+        [{"node", "score"}, ...], nearest first."""
+        r = await self._post("/match", {"vector": vector, "limit": limit, "mode": "vector"})
+        return r.get("hits", [])
 
     async def quarantine(self, origin_prefix: str, trust: float = 0.0) -> dict:
         """Set the trust level for a provenance prefix. 0.0 removes the
