@@ -744,11 +744,17 @@ async function init(){
   await loadStats();
   await loadConfig(true);
 }
-// deep-linkable tabs: /ui#trust opens the trust tab
+// deep links: /ui#trust opens a tab; /ui?seeds=api,db runs a retrieval
 {
   const t=location.hash.slice(1);
   const b=t&&document.querySelector(`nav button[data-tab=${JSON.stringify(t)}]`);
   if(b)b.click();
+  const q=new URLSearchParams(location.search).get('seeds');
+  if(q){
+    $('#seeds').value=q;
+    document.querySelector('nav button[data-tab=retr]').click();
+    doRetrieve();
+  }
 }
 init();
 </script>
