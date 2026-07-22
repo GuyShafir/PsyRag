@@ -30,6 +30,7 @@ mod engine;
 mod export;
 mod log;
 mod metrics;
+mod mcp;
 mod monitor;
 mod prom;
 mod serve;
@@ -42,7 +43,7 @@ use std::path::Path;
 
 const USAGE: &str = "psyrag <command> [flags]
 commands: config ingest retrieve touch feedback consolidate sleep stats
-          checkpoint verify backup purge export-bq db serve standby monitor
+          checkpoint verify backup purge export-bq db serve standby monitor mcp
 standby:  --primary URL [--primary-token T] [--follow-db NAME] [--poll-ms N]
           --wal PATH --addr HOST:PORT   (read-only warm replica of a primary)
 global:   --wal PATH  --sidecar PATH  --config PATH.json  --data-dir DIR  --db NAME
@@ -100,7 +101,7 @@ fn parse_every(s: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(n * mult))
 }
 
-fn open_engine(a: &Args) -> Result<Engine, String> {
+pub(crate) fn open_engine(a: &Args) -> Result<Engine, String> {
     let (wal, scp, db_cfg) = db_paths(a)?;
     // Config precedence: explicit --config > the db's config.json > defaults.
     let cfg = config::load(a.get("config").or(db_cfg.as_deref()))?;
@@ -612,6 +613,8 @@ fn dispatch(a: &Args) -> Result<(), String> {
             let interval = a.get_i64("interval-ms").unwrap_or(500) as u64;
             monitor::run(&url, interval)?;
         }
+        Some("mcp") => mcp::run_mcp(a)?,
+        Some("mcp-send") => mcp::run_mcp_send(a)?,
         Some(other) => return Err(format!("unknown command '{other}'\n{USAGE}")),
         None => {
             println!("{USAGE}");
