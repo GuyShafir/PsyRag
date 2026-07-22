@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+#[derive(Clone)]
 pub struct Args {
     pub positionals: Vec<String>,
     flags: HashMap<String, Vec<String>>,
@@ -72,5 +73,12 @@ impl Args {
     }
     pub fn get_usize(&self, key: &str) -> Option<usize> {
         self.get(key).and_then(|s| s.parse().ok())
+    }
+
+    /// Return a clone with `key` forced to `val`, for programmatic path
+    /// injection (e.g. pointing `open_engine` at the resolved `.psyrag/` WAL).
+    pub fn with_override(mut self, key: &str, val: &str) -> Self {
+        self.flags.insert(key.to_string(), vec![val.to_string()]);
+        self
     }
 }
