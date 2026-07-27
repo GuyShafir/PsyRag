@@ -4,7 +4,8 @@ use std::path::Path;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub fn read_last_sleep(path: &Path) -> i64 {
-    std::fs::read_to_string(path).ok()
+    std::fs::read_to_string(path)
+        .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0)
 }

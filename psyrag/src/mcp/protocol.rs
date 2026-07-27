@@ -24,19 +24,25 @@ fn tool_schema() -> serde_json::Value {
 
 pub fn dispatch(engine: &mut Engine, ring: &mut TraceRing, req: &Request) -> Option<Response> {
     match req.method.as_str() {
-        "initialize" => Some(Response::result(&req.id, json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "psyrag", "version": env!("CARGO_PKG_VERSION")}
-        }))),
+        "initialize" => Some(Response::result(
+            &req.id,
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "psyrag", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        )),
         "notifications/initialized" => None, // notification: no reply
         "ping" => Some(Response::result(&req.id, json!({}))),
         "tools/list" => Some(Response::result(&req.id, json!({"tools": [tool_schema()]}))),
         "tools/call" => {
             let args = &req.params["arguments"];
             if req.params["name"] != "psyrag_recall" {
-                return Some(Response::error(&req.id, -32602,
-                    &format!("unknown tool {}", req.params["name"])));
+                return Some(Response::error(
+                    &req.id,
+                    -32602,
+                    &format!("unknown tool {}", req.params["name"]),
+                ));
             }
             let query = args["query"].as_str().unwrap_or("");
             if query.is_empty() {
@@ -45,12 +51,18 @@ pub fn dispatch(engine: &mut Engine, ring: &mut TraceRing, req: &Request) -> Opt
             let k = args["k"].as_u64().unwrap_or(10) as usize;
             let depth = args["depth"].as_u64().unwrap_or(2) as u32;
             let text = recall(engine, ring, query, k, depth);
-            Some(Response::result(&req.id, json!({
-                "content": [{"type": "text", "text": text}]
-            })))
+            Some(Response::result(
+                &req.id,
+                json!({
+                    "content": [{"type": "text", "text": text}]
+                }),
+            ))
         }
         // notifications (no id) we don't handle: swallow. requests: method not found.
-        _ => req.id.as_ref().map(|_| Response::error(&req.id, -32601, "method not found")),
+        _ => req
+            .id
+            .as_ref()
+            .map(|_| Response::error(&req.id, -32601, "method not found")),
     }
 }
 
@@ -74,9 +86,14 @@ mod tests {
         let pg = psyrag_graph::PersistentGraph::open(&wal).unwrap();
         let mut layer = psyrag_core::PlasticityLayer::new(Default::default());
         layer.sync(pg.graph());
-        Engine { pg, layer, sidecar_path: dir.join("s.json").to_string_lossy().into(),
-                 traces: crate::engine::TraceStore::in_memory(16),
-                 idem: crate::engine::IdemStore::in_memory(16, 60_000), wedged: None }
+        Engine {
+            pg,
+            layer,
+            sidecar_path: dir.join("s.json").to_string_lossy().into(),
+            traces: crate::engine::TraceStore::in_memory(16),
+            idem: crate::engine::IdemStore::in_memory(16, 60_000),
+            wedged: None,
+        }
     }
 
     #[test]

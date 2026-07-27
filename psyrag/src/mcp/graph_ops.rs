@@ -17,38 +17,62 @@ pub struct TouchWindow {
 }
 
 impl TouchWindow {
-    pub fn new(n: usize) -> Self { TouchWindow { span: n, recent: VecDeque::with_capacity(n) } }
+    pub fn new(n: usize) -> Self {
+        TouchWindow {
+            span: n,
+            recent: VecDeque::with_capacity(n),
+        }
+    }
     pub fn record(&mut self, path: &str) -> Vec<(String, String)> {
-        let pairs: Vec<(String, String)> = self.recent.iter()
+        let pairs: Vec<(String, String)> = self
+            .recent
+            .iter()
             .filter(|p| p.as_str() != path)
             .map(|p| (path.to_string(), p.clone()))
             .collect();
         self.recent.retain(|p| p != path);
         self.recent.push_front(path.to_string());
-        while self.recent.len() > self.span { self.recent.pop_back(); }
+        while self.recent.len() > self.span {
+            self.recent.pop_back();
+        }
         pairs
     }
 }
 
 /// Observe a touched file as a node and journal co-touch edges to recent
 /// files. One WAL batch: record ops, flush, sync sidecar columns, save.
-pub fn ingest_touch(engine: &mut Engine, window: &mut TouchWindow, path: &str) -> Result<(), String> {
-    if engine.wedged.is_some() { return Ok(()); } // never write to a wedged db
+pub fn ingest_touch(
+    engine: &mut Engine,
+    window: &mut TouchWindow,
+    path: &str,
+) -> Result<(), String> {
+    if engine.wedged.is_some() {
+        return Ok(());
+    } // never write to a wedged db
     let ts = now_ms();
     let pairs = window.record(path);
     engine.pg.record_op(Op::ObserveNode {
-        name: path.to_string(), asset_type: FILE_TYPE.into(),
-        props: json!({}), ts, origin: Some(ORIGIN.into()),
+        name: path.to_string(),
+        asset_type: FILE_TYPE.into(),
+        props: json!({}),
+        ts,
+        origin: Some(ORIGIN.into()),
     })?;
     for (src, dst) in &pairs {
         // ensure the dst node exists before the edge (idempotent observe)
         engine.pg.record_op(Op::ObserveNode {
-            name: dst.clone(), asset_type: FILE_TYPE.into(),
-            props: json!({}), ts, origin: Some(ORIGIN.into()),
+            name: dst.clone(),
+            asset_type: FILE_TYPE.into(),
+            props: json!({}),
+            ts,
+            origin: Some(ORIGIN.into()),
         })?;
         engine.pg.record_op(Op::ObserveEdge {
-            src: src.clone(), dst: dst.clone(), kind: CO_EDITED.into(),
-            ts, origin: Some(ORIGIN.into()),
+            src: src.clone(),
+            dst: dst.clone(),
+            kind: CO_EDITED.into(),
+            ts,
+            origin: Some(ORIGIN.into()),
         })?;
     }
     engine.pg.flush()?;
@@ -78,20 +102,27 @@ pub fn cold_start_from_git(engine: &mut Engine, repo_root: &Path) -> Result<usiz
     let ts = now_ms();
     let mut added = 0usize;
     for commit in text.split('\u{0}') {
-        let files: Vec<&str> = commit.lines()
+        let files: Vec<&str> = commit
+            .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .take(5)
             .collect();
         for (i, &a) in files.iter().enumerate() {
             engine.pg.record_op(Op::ObserveNode {
-                name: a.into(), asset_type: FILE_TYPE.into(),
-                props: json!({}), ts, origin: Some(ORIGIN.into()),
+                name: a.into(),
+                asset_type: FILE_TYPE.into(),
+                props: json!({}),
+                ts,
+                origin: Some(ORIGIN.into()),
             })?;
             for &b in files.iter().skip(i + 1) {
                 engine.pg.record_op(Op::ObserveEdge {
-                    src: a.into(), dst: b.into(), kind: CO_EDITED.into(),
-                    ts, origin: Some(ORIGIN.into()),
+                    src: a.into(),
+                    dst: b.into(),
+                    kind: CO_EDITED.into(),
+                    ts,
+                    origin: Some(ORIGIN.into()),
                 })?;
                 added += 1;
             }
@@ -111,9 +142,18 @@ mod tests {
     fn window_pairs_recent_touches_within_span() {
         let mut w = TouchWindow::new(3);
         assert_eq!(w.record("a.rs"), Vec::<(String, String)>::new()); // first: no pairs
-        assert_eq!(w.record("b.rs"), vec![("b.rs".to_string(), "a.rs".to_string())]);
+        assert_eq!(
+            w.record("b.rs"),
+            vec![("b.rs".to_string(), "a.rs".to_string())]
+        );
         let pairs = w.record("c.rs"); // pairs with b and a (window 3)
-        assert_eq!(pairs, vec![("c.rs".into(), "b.rs".into()), ("c.rs".into(), "a.rs".into())]);
+        assert_eq!(
+            pairs,
+            vec![
+                ("c.rs".into(), "b.rs".into()),
+                ("c.rs".into(), "a.rs".into())
+            ]
+        );
     }
 
     #[test]

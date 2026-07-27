@@ -22,16 +22,22 @@ pub enum Event {
 pub fn send(sock: &Path, ev: &Event) {
     if let Ok(mut s) = UnixStream::connect(sock) {
         let _ = s.set_write_timeout(Some(std::time::Duration::from_millis(200)));
-        let mut line = match serde_json::to_string(ev) { Ok(l) => l, Err(_) => return };
+        let mut line = match serde_json::to_string(ev) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
         line.push('\n');
         let _ = s.write_all(line.as_bytes());
     }
 }
 
 /// Apply one received event to the engine under the caller's lock.
-pub fn apply(engine: &mut Engine, window: &mut TouchWindow, ring: &TraceRing, ev: &Event)
-    -> Result<(), String>
-{
+pub fn apply(
+    engine: &mut Engine,
+    window: &mut TouchWindow,
+    ring: &TraceRing,
+    ev: &Event,
+) -> Result<(), String> {
     match ev {
         Event::Used { path } => {
             // ingest_touch no-ops when the engine is wedged (read-only); skip
@@ -44,11 +50,15 @@ pub fn apply(engine: &mut Engine, window: &mut TouchWindow, ring: &TraceRing, ev
                 let ts = now_ms();
                 let traces: Vec<_> = ring.iter().cloned().collect();
                 for tr in &traces {
-                    let surfaced_here = tr.surfaced().iter()
+                    let surfaced_here = tr
+                        .surfaced()
+                        .iter()
                         .any(|(id, _)| engine.pg.graph().node_name(*id) == path);
                     if surfaced_here {
                         let credit = Credit::Nodes(vec![(path.clone(), hit)]);
-                        engine.layer.apply_credit(engine.pg.graph(), tr, &credit, ts);
+                        engine
+                            .layer
+                            .apply_credit(engine.pg.graph(), tr, &credit, ts);
                     }
                 }
                 // Required second save: ingest_touch already saved once above,
@@ -74,7 +84,9 @@ mod tests {
 
     #[test]
     fn event_json_roundtrips() {
-        let ev = Event::Used { path: "src/a.rs".into() };
+        let ev = Event::Used {
+            path: "src/a.rs".into(),
+        };
         let line = serde_json::to_string(&ev).unwrap();
         assert!(line.contains("\"kind\":\"used\""));
         let back: Event = serde_json::from_str(&line).unwrap();

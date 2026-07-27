@@ -15,8 +15,10 @@ impl Response {
         Response(json!({"jsonrpc": "2.0", "id": id.clone().unwrap_or(Value::Null), "result": r}))
     }
     pub fn error(id: &Option<Value>, code: i64, msg: &str) -> Response {
-        Response(json!({"jsonrpc": "2.0", "id": id.clone().unwrap_or(Value::Null),
-                        "error": {"code": code, "message": msg}}))
+        Response(
+            json!({"jsonrpc": "2.0", "id": id.clone().unwrap_or(Value::Null),
+                        "error": {"code": code, "message": msg}}),
+        )
     }
     pub fn to_line(&self) -> String {
         self.0.to_string()
@@ -26,14 +28,23 @@ impl Response {
 /// Parse one line as a JSON-RPC request. On malformed JSON, return a ready
 /// parse-error response (-32700, id null) so the caller can just send it.
 pub fn parse(line: &str) -> Result<Request, Response> {
-    let v: Value = serde_json::from_str(line)
-        .map_err(|_| Response::error(&None, -32700, "parse error"))?;
-    let method = v["method"].as_str()
+    let v: Value =
+        serde_json::from_str(line).map_err(|_| Response::error(&None, -32700, "parse error"))?;
+    let method = v["method"]
+        .as_str()
         .ok_or_else(|| Response::error(&None, -32600, "missing method"))?
         .to_string();
     // id absent => notification (id stays None; no reply expected).
-    let id = if v.get("id").is_some() { Some(v["id"].clone()) } else { None };
-    Ok(Request { id, method, params: v["params"].clone() })
+    let id = if v.get("id").is_some() {
+        Some(v["id"].clone())
+    } else {
+        None
+    };
+    Ok(Request {
+        id,
+        method,
+        params: v["params"].clone(),
+    })
 }
 
 #[cfg(test)]
