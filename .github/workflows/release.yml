@@ -9,7 +9,20 @@ permissions:
   packages: write
 
 jobs:
+  # Create the release exactly once BEFORE the binary matrix fans out.
+  # Without this, parallel matrix jobs race to create the release for the
+  # tag and the losers fail with "already_exists" (bit v0.6.0: the macOS
+  # job died and its tarball was missing until a manual re-run).
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: false
+          body: "See CHANGELOG.md for details."
+
   binaries:
+    needs: create-release
     strategy:
       matrix:
         include:
