@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 — 2026-07-28
+
+### MCP: adaptive memory for Claude Code (community contribution)
+- `psyrag mcp` (by @nanov — PsyRag's first outside contribution) embeds the
+  engine and speaks MCP over stdio: one model-facing `psyrag_recall` tool,
+  automatic ingestion of the agent's Read/Edit events into a file co-touch
+  graph via a unix-socket hook shim (`psyrag mcp-send`), usage credit for
+  recalled files that actually get opened, git-history cold start, and
+  biology-matched maintenance (PreCompact → consolidate, >24h-stale startup
+  → sleep). Memory lives in `.psyrag/` at the repo root. Install + hook
+  wiring in docs/mcp.md. Zero new dependencies.
 
 ### WAL-shipping warm standby
 - New `psyrag standby --primary URL` mode: a read-only warm replica that
@@ -17,6 +27,7 @@
 - Replication endpoints are denied to read-only tokens. `scripts/standby.sh`
   drills the full lifecycle (replicate → read-only → weight shipping →
   checkpoint resync → primary kill → promote, zero acked-write loss) in CI.
+
 ### Semantic seed selection
 - Nodes may carry a reserved `props.embedding` (bring-your-own vector, any
   model/dimension). It is indexed for cosine search and rides the existing
