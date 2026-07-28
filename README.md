@@ -40,11 +40,11 @@ Where a RAG store returns the same thing forever, PsyRag learns.
 
 ```bash
 # linux x86-64
-curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.5.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.6.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
 # linux arm64 (Graviton, Ampere, Raspberry Pi)
-curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.5.0-aarch64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.6.0-aarch64-unknown-linux-gnu.tar.gz | tar xz
 # macOS (Apple silicon)
-curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.5.0-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.6.0-aarch64-apple-darwin.tar.gz | tar xz
 
 ./psyrag --wal mem.wal serve
 ```
