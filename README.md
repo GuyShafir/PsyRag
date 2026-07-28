@@ -135,6 +135,8 @@ PsyRag is one product, three Rust crates:
 - **`psyrag-core`** — the adaptive memory engine (plasticity, retrieval,
   feedback, consolidation, sleep) and the `GraphBackend` tiered-storage seam.
 - **`psyrag`** — the binary: server, CLI, web console.
+- **MCP** — `psyrag mcp` makes PsyRag a local adaptive memory for Claude Code;
+  see [docs/mcp.md](docs/mcp.md).
 
 Plus a **`python/`** package (ADK memory service, feedback adapters,
 zero-dependency client with automatic idempotent retries).
