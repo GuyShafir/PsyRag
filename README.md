@@ -22,6 +22,25 @@ same query "pricing", before and after "metering" proved useful 20×:
 
 Where a RAG store returns the same thing forever, PsyRag learns.
 
+## The claim, measured
+
+![adaptive recall benchmark](bench/results.svg)
+
+A deterministic, zero-dependency benchmark where which docs are *truly
+useful* is invisible to text and only usage feedback can reveal it — with the
+useful set switching mid-run. Adaptive recall climbs to ~1.0, crashes when
+the world changes (the honest cost of having learned the old regime), and
+re-learns to ~0.9; the same engine with feedback off, and BM25, never leave
+the floor. Feedback is attention-limited, not an oracle. Reproduce it:
+
+```bash
+cargo run --release -p psyrag --example adaptive_bench
+```
+
+Design, config rationale, and two dynamics findings in
+[docs/bench.md](docs/bench.md). CI runs `--check` on every push: the chart
+above can never silently go stale against the code.
+
 ## Why it's different
 
 | | vector / keyword memory | PsyRag |
@@ -123,6 +142,7 @@ and the Docker image.
 | [docs/integrations.md](docs/integrations.md) | web console + Python/ADK integration |
 | [docs/deployment.md](docs/deployment.md) | Docker, security, observability, testing |
 | [docs/runbook.md](docs/runbook.md) | operations: capacity, upgrades, backup drills, RPO/RTO |
+| [docs/bench.md](docs/bench.md) | the adaptive-recall benchmark: design + how to reproduce |
 | [python/README.md](python/README.md) | ADK memory service quickstart |
 | [gcp/README.md](gcp/README.md) | Spanner / BigQuery backends (roadmap + export) |
 

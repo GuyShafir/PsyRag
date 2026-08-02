@@ -24,6 +24,8 @@ jobs:
         run: cargo test --workspace
       - name: End-to-end smoke suite
         run: bash scripts/smoke.sh
+      - name: Adaptive-recall benchmark assertion (the README chart's claim)
+        run: cargo run --release -p psyrag --example adaptive_bench -- --check
       - name: kill -9 crash-recovery suite (acked-write durability)
         run: bash scripts/crash.sh 5
       - name: warm-standby replication + failover drill
