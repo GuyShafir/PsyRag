@@ -294,6 +294,19 @@ score}], "indexed": N }`: cosine top-k over node embeddings, nearest first,
 `indexed` being the number of embedded nodes. Entries whose dimension differs
 from the query are skipped; an empty or zero query vector is a 400.
 
+### `POST /blast`
+`{ "node": "...", "direction"?: "down"|"up"|"both", "depth"?: 1-16, "ts"? }` →
+`{ node, count, reach: [{node, node_type, depth, path}] }`. Reachability from
+a node at an instant, with every hit carrying its full traversal path
+(`origin -[KIND]-> hop -[KIND]-> node`) — built for prompt injection so an
+LLM sees *why* something is in the blast radius. `down` = what does this
+affect; `up` = what does this depend on. Read scope.
+
+### `POST /diff`
+`{ "t1": ms, "t2": ms }` → `{ nodes_added, nodes_removed, nodes_changed,
+edges_added, edges_removed }`. The temporal diff — "what changed in this
+graph between t1 and t2?" — straight off the versioned history. Read scope.
+
 ### `POST /feedback`
 Provide **one** target and **one** credit spec.
 - Target: `"seeds": [..]` (retrieve fresh at `ts`) **or** `"trace_id": N` (credit a

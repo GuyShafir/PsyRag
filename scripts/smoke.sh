@@ -303,6 +303,25 @@ M=$(curl -s -X POST "$VURL/match" -d '{"vector":[1.0,0.0],"limit":1}')
 [ "$(echo "$M" | j 'd["indexed"]')" = "3" ] && ok "embeddings survive restart (WAL replay)" || no "embeddings lost on restart"
 kill $VSRV 2>/dev/null; wait $VSRV 2>/dev/null
 
+echo "== 20. graph analytics: blast radius + temporal diff =="
+APORT=$((PORT+9)); AURL="http://127.0.0.1:${APORT}"
+"$BIN" --data-dir "$WORK/analytics" serve --addr "127.0.0.1:${APORT}" >"$WORK/serve-a.log" 2>&1 &
+ASRV=$!; sleep 1.5
+curl -s -X POST "$AURL/ingest" -H 'Content-Type: application/json' -d '{"json":"[{\"name\":\"a\",\"type\":\"svc\",\"edges\":[{\"dst\":\"b\",\"kind\":\"K\"}]},{\"name\":\"b\",\"type\":\"svc\",\"edges\":[{\"dst\":\"c\",\"kind\":\"K\"}]},{\"name\":\"c\",\"type\":\"svc\"}]","ts":1000}' >/dev/null
+B=$(curl -s -X POST "$AURL/blast" -d '{"node":"a","direction":"down","depth":3,"ts":1500}')
+[ "$(echo "$B" | j 'd["count"]')" = "2" ] && ok "blast radius down from a reaches 2" || no "blast count wrong"
+echo "$B" | grep -q '\-\[K\]->' && ok "blast paths are explainable" || no "no path rendering"
+U=$(curl -s -X POST "$AURL/blast" -d '{"node":"c","direction":"up","depth":3,"ts":1500}')
+[ "$(echo "$U" | j 'd["count"]')" = "2" ] && ok "blast radius up from c reaches 2" || no "upstream blast wrong"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$AURL/blast" -d '{"node":"a","direction":"sideways"}')
+[ "$C" = "400" ] && ok "bad direction -> 400" || no "direction not validated ($C)"
+# retire c via reconcile snapshot at t=2000, then diff across the change
+curl -s -X POST "$AURL/ingest" -d '{"json":"[{\"name\":\"a\",\"type\":\"svc\",\"edges\":[{\"dst\":\"b\",\"kind\":\"K\"}]},{\"name\":\"b\",\"type\":\"svc\"}]","reconcile":true,"ts":2000}' >/dev/null
+D=$(curl -s -X POST "$AURL/diff" -d '{"t1":1500,"t2":2500}')
+echo "$D" | python3 -c 'import sys,json;d=json.load(sys.stdin);exit(0 if "c" in d["nodes_removed"] else 1)' \
+  && ok "temporal diff shows c removed" || no "diff missed the retirement"
+kill $ASRV 2>/dev/null; wait $ASRV 2>/dev/null
+
 rm -rf "$WORK"
 echo; echo "==== $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

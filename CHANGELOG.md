@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Graph analytics over the wire
+- `POST /blast` — blast-radius reachability at an instant, every hit carrying
+  its full traversal path (`a -[K]-> b -[K]-> c`); direction down/up/both.
+- `POST /diff` — the temporal diff ("what changed between t1 and t2") from
+  the versioned history. Both were library-only since v0.3; now exposed over
+  HTTP, in the console (Graph tab / Maintenance tab), and in the Python
+  client (`blast()`, `diff()`).
+
 ## v0.6.0 — 2026-07-28
 
 ### MCP: adaptive memory for Claude Code (community contribution)
