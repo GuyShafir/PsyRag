@@ -13,7 +13,7 @@ use crate::mcp::graph_ops::{cold_start_from_git, TouchWindow};
 use crate::mcp::maintenance::sleep_if_stale;
 use crate::mcp::protocol::dispatch;
 use crate::mcp::recall::TraceRing;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -79,7 +79,11 @@ pub fn run_mcp(a: &Args) -> Result<(), String> {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            let reader = BufReader::new(stream);
+            // Cap bytes read per connection (1 MiB). The hook shim writes one
+            // short line per connect, so anything larger is garbage or abuse;
+            // without the cap a rogue writer that never sends '\n' would grow
+            // the line buffer without bound.
+            let reader = BufReader::new(stream.take(1 << 20));
             for line in reader.lines().map_while(Result::ok) {
                 let Ok(ev) = serde_json::from_str::<Event>(&line) else {
                     continue;
@@ -134,7 +138,6 @@ pub fn run_mcp_send(_a: &Args) -> Result<(), String> {
         Err(_) => return Ok(()),
     };
     let mut input = String::new();
-    use std::io::Read as _;
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     // PreCompact hook => Compact; PostToolUse(Read|Edit) => Used{file_path}.
@@ -149,10 +152,13 @@ pub fn run_mcp_send(_a: &Args) -> Result<(), String> {
         if path.is_empty() {
             return Ok(());
         }
-        // store repo-relative to match ingest namespace
+        // store repo-relative to match ingest namespace; a touch outside the
+        // repo root emits no event at all.
         let root = paths.dir.parent().unwrap_or(&paths.dir);
-        let rel = repo_relative(root, path);
-        Event::Used { path: rel }
+        match repo_relative(root, path) {
+            Some(rel) => Event::Used { path: rel },
+            None => return Ok(()),
+        }
     };
     send(&paths.sock, &ev);
     Ok(())
@@ -161,13 +167,15 @@ pub fn run_mcp_send(_a: &Args) -> Result<(), String> {
 /// Derive the repo-relative node name for a touched file. Canonicalizes the
 /// path (best-effort — a just-deleted file falls back to the raw string) so it
 /// strips cleanly against the canonicalized repo root even when the root is
-/// reached through a symlink (e.g. macOS /tmp -> /private/tmp). Without this,
-/// an absolute path leaks into the node namespace and credit never lands.
-fn repo_relative(root: &Path, raw: &str) -> String {
+/// reached through a symlink (e.g. macOS /tmp -> /private/tmp). Returns None
+/// when the path lies outside the root: such touches are skipped entirely,
+/// since an absolute path would leak into the node namespace as a node that
+/// nothing ever recalls and credit never lands on.
+fn repo_relative(root: &Path, raw: &str) -> Option<String> {
     let abs = std::fs::canonicalize(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw));
     abs.strip_prefix(root)
+        .ok()
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -191,7 +199,28 @@ mod tests {
         // raw absolute path to the file (as a hook would pass tool_input.file_path)
         let raw = root.join("src/a.rs");
         let rel = repo_relative(&croot, raw.to_str().unwrap());
-        assert_eq!(rel, "src/a.rs");
+        assert_eq!(rel.as_deref(), Some("src/a.rs"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn repo_relative_skips_out_of_root_paths() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let base = std::path::PathBuf::from("/tmp").join(format!(
+            "psyrag-oor-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // a real file that lives next to, not inside, the repo root
+        std::fs::write(base.join("outside.rs"), b"x").unwrap();
+        let croot = std::fs::canonicalize(&root).unwrap();
+        let raw = base.join("outside.rs");
+        // None => run_mcp_send emits no event, so the absolute path never
+        // becomes a graph node.
+        assert_eq!(repo_relative(&croot, raw.to_str().unwrap()), None);
         std::fs::remove_dir_all(&base).ok();
     }
 }
