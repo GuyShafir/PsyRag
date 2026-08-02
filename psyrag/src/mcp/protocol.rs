@@ -22,6 +22,15 @@ fn tool_schema() -> serde_json::Value {
     })
 }
 
+/// Model-facing recall knobs are clamped, not validated: a wild k or depth
+/// silently becomes the nearest bound (k in 1..=100, depth in 1..=8) instead
+/// of erroring the tool call.
+fn recall_limits(args: &serde_json::Value) -> (usize, u32) {
+    let k = args["k"].as_u64().unwrap_or(10).clamp(1, 100) as usize;
+    let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 8) as u32;
+    (k, depth)
+}
+
 pub fn dispatch(engine: &mut Engine, ring: &mut TraceRing, req: &Request) -> Option<Response> {
     match req.method.as_str() {
         "initialize" => Some(Response::result(
@@ -48,8 +57,7 @@ pub fn dispatch(engine: &mut Engine, ring: &mut TraceRing, req: &Request) -> Opt
             if query.is_empty() {
                 return Some(Response::error(&req.id, -32602, "query is required"));
             }
-            let k = args["k"].as_u64().unwrap_or(10) as usize;
-            let depth = args["depth"].as_u64().unwrap_or(2) as u32;
+            let (k, depth) = recall_limits(args);
             let text = recall(engine, ring, query, k, depth);
             Some(Response::result(
                 &req.id,
@@ -122,6 +130,18 @@ mod tests {
         let mut ring = TraceRing::new(8);
         let req = parse(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).unwrap();
         assert!(dispatch(&mut e, &mut ring, &req).is_none());
+    }
+
+    #[test]
+    fn recall_limits_clamps_silently() {
+        // absent => defaults, in range untouched
+        assert_eq!(recall_limits(&json!({})), (10, 2));
+        assert_eq!(recall_limits(&json!({"k": 5, "depth": 3})), (5, 3));
+        // zero and huge both land on the nearest bound, never an error
+        assert_eq!(recall_limits(&json!({"k": 0, "depth": 0})), (1, 1));
+        assert_eq!(recall_limits(&json!({"k": 100000, "depth": 64})), (100, 8));
+        // non-integers (as_u64 => None) fall back to defaults
+        assert_eq!(recall_limits(&json!({"k": -3, "depth": "deep"})), (10, 2));
     }
 
     #[test]

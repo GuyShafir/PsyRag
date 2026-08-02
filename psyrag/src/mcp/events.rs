@@ -41,9 +41,11 @@ pub fn apply(
     match ev {
         Event::Used { path } => {
             // ingest_touch no-ops when the engine is wedged (read-only); skip
-            // the credit loop and the follow-up save too so a wedged db does
-            // no further pointless (guaranteed-failing) work.
-            ingest_touch(engine, window, path)?;
+            // the credit loop and the save too so a wedged db does no further
+            // pointless (guaranteed-failing) work. save: false — the whole
+            // Used path persists exactly once, below, after credit lands (the
+            // WAL is still flushed inside ingest_touch, before any save).
+            ingest_touch(engine, window, path, false)?;
             if engine.wedged.is_none() {
                 // Credit any live trace that surfaced this path (explicit mode).
                 let hit = 1.0f32;
@@ -61,10 +63,8 @@ pub fn apply(
                             .apply_credit(engine.pg.graph(), tr, &credit, ts);
                     }
                 }
-                // Required second save: ingest_touch already saved once above,
-                // but apply_credit (just above) ran after that save, so its
-                // updates need their own persist — without this, learning
-                // from credit application would be silently dropped.
+                // Single save for the whole event: covers both the touch
+                // (deferred from ingest_touch) and the credit updates above.
                 engine.save_sidecar()?;
             }
             Ok(())

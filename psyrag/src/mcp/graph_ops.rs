@@ -40,11 +40,15 @@ impl TouchWindow {
 }
 
 /// Observe a touched file as a node and journal co-touch edges to recent
-/// files. One WAL batch: record ops, flush, sync sidecar columns, save.
+/// files. One WAL batch: record ops, flush, sync sidecar columns. The WAL is
+/// always flushed before returning; the sidecar is saved only when `save` is
+/// set — the Used event path passes false and persists once at the end, after
+/// credit application, so one event costs one sidecar write.
 pub fn ingest_touch(
     engine: &mut Engine,
     window: &mut TouchWindow,
     path: &str,
+    save: bool,
 ) -> Result<(), String> {
     if engine.wedged.is_some() {
         return Ok(());
@@ -77,7 +81,9 @@ pub fn ingest_touch(
     }
     engine.pg.flush()?;
     engine.layer.sync(engine.pg.graph());
-    engine.save_sidecar()?;
+    if save {
+        engine.save_sidecar()?;
+    }
     Ok(())
 }
 
