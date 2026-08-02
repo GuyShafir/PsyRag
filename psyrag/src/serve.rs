@@ -473,6 +473,9 @@ fn d_match_limit() -> usize {
 fn d_seed_k() -> usize {
     4
 }
+fn d_blast_depth() -> u32 {
+    3
+}
 /// Reject empty/oversized/degenerate query vectors with a 400. (JSON cannot
 /// encode NaN/Infinity, so parsed elements are always finite.)
 fn validate_vector(q: &[f32]) -> Option<Resp> {
@@ -1377,6 +1380,54 @@ fn handle_db(
         (Method::Get, "/stats") => {
             let e = db.engine.read().unwrap();
             json_resp(&e.layer.stats(e.pg.graph()), 200)
+        }
+        // Graph analytics (read-only): reachability with explainable paths,
+        // and the temporal diff — "what changed between t1 and t2?"
+        (Method::Post, "/blast") => {
+            #[derive(Deserialize)]
+            struct BlastReq {
+                node: String,
+                ts: Option<i64>,
+                /// "down" (what does this affect), "up" (what does this
+                /// depend on), or "both" (default).
+                #[serde(default)]
+                direction: Option<String>,
+                #[serde(default = "d_blast_depth")]
+                depth: u32,
+            }
+            let r: BlastReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return err(&format!("bad body: {e}"), 400),
+            };
+            let dir = match r.direction.as_deref() {
+                None | Some("both") => psyrag_graph::graph::Direction::Both,
+                Some("down") => psyrag_graph::graph::Direction::Down,
+                Some("up") => psyrag_graph::graph::Direction::Up,
+                Some(other) => {
+                    return err(&format!("bad direction '{other}' (want down|up|both)"), 400)
+                }
+            };
+            let depth = r.depth.clamp(1, 16);
+            let ts = r.ts.unwrap_or_else(now_ms);
+            let e = db.engine.read().unwrap();
+            let reach = e.pg.graph().blast_radius(&r.node, ts, dir, depth);
+            json_resp(
+                &serde_json::json!({"node": r.node, "count": reach.len(), "reach": reach}),
+                200,
+            )
+        }
+        (Method::Post, "/diff") => {
+            #[derive(Deserialize)]
+            struct DiffReq {
+                t1: i64,
+                t2: i64,
+            }
+            let r: DiffReq = match serde_json::from_str(body) {
+                Ok(r) => r,
+                Err(e) => return err(&format!("bad body: {e}"), 400),
+            };
+            let e = db.engine.read().unwrap();
+            json_resp(&e.pg.graph().diff(r.t1, r.t2), 200)
         }
         // -- WAL shipping (replication source) ------------------------------
         // A follower pulls durable WAL bytes from an offset (path segment) to

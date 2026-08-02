@@ -107,6 +107,15 @@
       <span class="muted" id="gmeta"></span></div>
     <svg id="gsvg" class="viz"></svg>
     <div class="legend">edge width = current (trust-masked) weight · faded = retired · click a node to use it as a retrieval seed</div>
+    <h3>blast radius <span class="muted" style="text-transform:none">(reachability with explainable paths)</span></h3>
+    <div class="row">
+      node<input id="bnode" style="min-width:190px" placeholder="node name"/>
+      <select id="bdir" title="down: what does this affect · up: what does this depend on"><option value="both">both</option><option value="down">down</option><option value="up">up</option></select>
+      depth<input type="number" id="bdepth" value="3" min="1" max="16"/>
+      <button class="ghost" onclick="doBlast()">blast radius</button>
+      <span class="muted" id="bmeta"></span>
+    </div>
+    <table id="btbl"></table>
   </section>
 
   <!-- RETRIEVE -->
@@ -187,6 +196,16 @@
         <h3 style="margin-top:0">stored traces</h3>
         <div class="row"><button class="ghost" onclick="loadTraces()">list traces</button><span class="muted" id="tmeta"></span></div>
         <div id="tlist" class="row"></div>
+      </div>
+      <div class="panel">
+        <h3 style="margin-top:0">time-travel diff</h3>
+        <div class="muted">what changed between two instants (ms timestamps).</div>
+        <div class="row">
+          t1<input type="number" id="difft1" placeholder="earlier ms"/>
+          t2<input type="number" id="difft2" placeholder="later ms (blank = now)"/>
+          <button class="ghost" onclick="doDiff()">diff</button>
+          <span class="muted" id="diffmeta"></span>
+        </div>
       </div>
     </div>
     <pre id="mntout" style="display:none"></pre>
@@ -528,6 +547,29 @@ async function doTouch(){
     const r=await post('/touch',body);
     $('#touchout').textContent=`touched ${r.touched}, missed ${r.missed}`;
   }catch(e){fail(e,'touch')}
+}
+
+// ---------- graph analytics ----------
+async function doBlast(){
+  const node=$('#bnode').value.trim(); if(!node)return;
+  try{
+    const r=await post('/blast',{node,direction:$('#bdir').value,depth:+$('#bdepth').value||3});
+    $('#bmeta').textContent=`${r.count} reachable`;
+    $('#btbl').innerHTML='<tr><th>depth</th><th>node</th><th>type</th><th>path</th></tr>'+
+      (r.reach||[]).map(x=>`<tr><td>${x.depth}</td><td>${esc(x.node)}</td><td class="muted">${esc(x.node_type||'')}</td><td class="muted">${esc(x.path||'')}</td></tr>`).join('')
+      ||'<tr><td colspan="4" class="muted">nothing reachable (node unknown or retired at ts)</td></tr>';
+  }catch(e){fail(e,'blast')}
+}
+async function doDiff(){
+  const t1=+$('#difft1').value; if(!$('#difft1').value){$('#diffmeta').textContent='t1 required';return}
+  const t2=$('#difft2').value?+$('#difft2').value:Date.now();
+  try{
+    const r=await post('/diff',{t1,t2});
+    const n=(r.nodes_added||[]).length+(r.nodes_removed||[]).length+(r.nodes_changed||[]).length
+      +(r.edges_added||[]).length+(r.edges_removed||[]).length;
+    $('#diffmeta').textContent=n?`${n} changes`:'no changes';
+    mntShow(r);
+  }catch(e){fail(e,'diff')}
 }
 
 // ---------- maintenance ----------

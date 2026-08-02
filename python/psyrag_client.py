@@ -201,6 +201,19 @@ class PsyRagClient:
         r = await self._post("/match", {"vector": vector, "limit": limit, "mode": "vector"})
         return r.get("hits", [])
 
+    async def blast(self, node: str, direction: str = "both",
+                    depth: int = 3, ts: Optional[int] = None) -> dict:
+        """Reachability from a node with explainable paths. direction:
+        "down" (what does this affect), "up" (dependencies), "both"."""
+        body: dict[str, Any] = {"node": node, "direction": direction, "depth": depth}
+        if ts is not None:
+            body["ts"] = ts
+        return await self._post("/blast", body)
+
+    async def diff(self, t1: int, t2: int) -> dict:
+        """Temporal diff: what changed in the graph between t1 and t2 (ms)."""
+        return await self._post("/diff", {"t1": t1, "t2": t2})
+
     async def quarantine(self, origin_prefix: str, trust: float = 0.0) -> dict:
         """Set the trust level for a provenance prefix. 0.0 removes the
         source's influence from retrieval entirely (a mask — learned weights
