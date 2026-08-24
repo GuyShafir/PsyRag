@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["fuzz"]
 resolver = "2"
 members = ["psyrag-graph", "psyrag-core", "psyrag"]
 
