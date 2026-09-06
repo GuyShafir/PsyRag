@@ -43,6 +43,7 @@ one exists.
 | **adaptive** | PsyRag with the feedback loop on: graded credit (`Credit::Nodes`), homeostat active, consolidation every 8 episodes |
 | **static** | ablation — the *same* graph and spreading activation with feedback never applied; isolates learning from structure |
 | **bm25** | Okapi BM25 (k1=1.2, b=0.75) over the candidates' token bags — the classic lexical baseline |
+| **adaptive+contrastive** | as adaptive, plus -0.3 credit for examined-but-useless docs, with `explore_floor = 0.05` (its own RNG stream, so the other series are unaffected) |
 
 Config deltas from defaults, and why: `alpha 0.10` (session-scale learning
 rate), `lambda_base 1e-6` (gentle decay so learning, not forgetting,
@@ -64,8 +65,10 @@ stay re-learnable; see "what the bench found" below).
    occasional deep examinations.
 
 `--check` (run in CI on every push) asserts the final adaptive recall beats
-both baselines by ≥0.25 and retains ≥80% of the pre-shift plateau — the
-README chart can never silently go stale against the code.
+both baselines by ≥0.25, retains ≥80% of the pre-shift plateau, and that the
+contrastive+floor series recovers at least as well as positive-only — the
+README chart can never silently go stale against the code, and issue #29
+can never silently regress.
 
 ## What the bench found (dynamics notes)
 
@@ -77,10 +80,18 @@ tuning a deployment:
   that the *post-shift* regime needs, and recovery caps out far below the
   pre-shift plateau. Forgetting aggressively is cheap until the world
   changes back.
-- **Anti-Hebbian depression can make a shift unrecoverable.** Feeding
-  negative credit for examined-but-useless docs (contrastive click
-  feedback), combined with per-source renormalization, crushed post-shift
-  candidates below the activation floor — they stopped surfacing at all, so
-  they could never earn credit again. Tracked as a GitHub issue; candidate
-  mitigations include a re-seed floor for alive edges and bounded
-  depression.
+- **Anti-Hebbian depression could make a shift unrecoverable — now fixed
+  (`explore_floor`).** Negative credit for examined-but-useless docs
+  (contrastive click feedback) drove live edges to *exactly* 0, where
+  consolidation pruned them as dead; the post-shift useful edges were
+  already gone before the shift. Recovery: 0.03. The fix is
+  `Config::explore_floor` (issue #29): depression is bounded at the floor
+  in stored state (you can push an edge down to the floor, never to
+  oblivion) and every live edge keeps a minimum salience at retrieval time
+  (a lens, like the trust mask — stored weights untouched; dead edges are
+  never resurrected). With `explore_floor = 0.05`, contrastive feedback
+  goes from the worst configuration to the **best**: recovery 0.97 vs 0.88
+  for positive-only, because the negative half actively unlearns the old
+  regime. That is the orange series on the chart. The floor is off by
+  default for wire compatibility; turn it on whenever you feed negative
+  credit.

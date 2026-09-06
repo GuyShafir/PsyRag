@@ -125,6 +125,17 @@ pub struct Config {
     pub sleep_downscale: f32,
     pub sleep_theta: f32,
     pub protect_top_frac: f32,
+
+    /// Exploration floor, as a fraction of `w0`, applied at RETRIEVAL time
+    /// only to live (non-pruned) edges: `salience = max(effective, floor)`.
+    /// Stored weights are untouched — like the trust mask, this is a lens,
+    /// not a write. Why it exists: depression (negative credit) can drive a
+    /// live edge's weight to exactly 0, and 0 is an absorbing state — an
+    /// edge that never surfaces is never examined, so it can never earn the
+    /// credit that would bring it back. A regime shift then becomes
+    /// unrecoverable (issue #29). A small floor keeps every live edge
+    /// discoverable at the bottom of the ranking. 0 = off (default).
+    pub explore_floor: f32,
 }
 
 impl Default for Config {
@@ -157,6 +168,7 @@ impl Default for Config {
             sleep_downscale: 0.6,
             sleep_theta: 0.05,
             protect_top_frac: 0.2,
+            explore_floor: 0.0,
         }
     }
 }
@@ -540,7 +552,15 @@ impl PlasticityLayer {
         if t <= 0.0 {
             return 0.0;
         }
-        self.eff(eid, t_now, scale) * t
+        let raw = self.eff(eid, t_now, scale);
+        // Exploration floor: a live edge never disappears from retrieval
+        // entirely (see Config::explore_floor). Dead edges stay at 0.
+        let floored = if self.cfg.explore_floor > 0.0 && !self.dead[eid as usize] {
+            raw.max(self.cfg.explore_floor * self.cfg.w0)
+        } else {
+            raw
+        };
+        floored * t
     }
 
     /// True current retrieval weight of an edge (pure read, trust-masked).
@@ -561,7 +581,17 @@ impl PlasticityLayer {
             }
             let decayed = self.eff(eid, t_now, scale);
             let r = r.clamp(-self.cfg.r_clip, self.cfg.r_clip);
-            self.w[i] = (decayed + self.cfg.alpha * r).max(0.0);
+            // Bounded depression: negative credit can push a live edge down
+            // to the exploration floor, never to exactly 0 — an exact zero
+            // is then pruned by consolidation as dead and can never be
+            // re-learned (issue #29). Disuse still decays below theta and
+            // prunes as before; only *feedback* is bounded here.
+            let lo = if self.cfg.explore_floor > 0.0 {
+                self.cfg.explore_floor * self.cfg.w0
+            } else {
+                0.0
+            };
+            self.w[i] = (decayed + self.cfg.alpha * r).max(lo);
             self.t_last[i] = t_now;
         }
     }

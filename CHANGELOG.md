@@ -14,6 +14,19 @@
   documented in `docs/bench.md` (prune floor x regime shift; depression +
   renormalization crushing post-shift candidates — issue #29).
 
+### Exploration floor: negative feedback is now safe (issue #29)
+- New `Config::explore_floor` (fraction of `w0`, default 0 = off). Negative
+  credit could drive a live edge to exactly 0, where consolidation pruned it
+  as dead and it could never be re-learned — a regime shift under
+  contrastive feedback recovered to 0.03. With the floor, depression is
+  bounded in stored state and every live edge keeps a minimum retrieval
+  salience (a lens, like the trust mask; dead edges are never resurrected).
+  Benchmark: contrastive feedback goes from worst (0.03) to best (0.97 vs
+  0.88 positive-only). Turn it on whenever you feed negative credit. The
+  benchmark gains a fourth series and CI now asserts the fix cannot regress.
+
+## Unreleased
+
 ### Graph analytics over the wire
 - `POST /blast` — blast-radius reachability at an instant, every hit carrying
   its full traversal path (`a -[K]-> b -[K]-> c`); direction down/up/both.
