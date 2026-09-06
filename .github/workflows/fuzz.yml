@@ -4,9 +4,32 @@ on:
   schedule:
     - cron: "0 4 * * 1"
   workflow_dispatch:
+  # PR-time build guard only (no fuzzing): the fuzz crate is excluded from
+  # the workspace, so nothing else ever compiles it — without this, a
+  # psyrag-graph refactor could break the targets silently and we'd find
+  # out at the next Monday-4am scheduled run.
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "psyrag-graph/**"
+      - ".github/workflows/fuzz.yml"
 
 jobs:
+  build-guard:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets (compile only)
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+
   fuzz:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -14,7 +37,7 @@ jobs:
       matrix:
         target: [wal_replay, entity_json]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
