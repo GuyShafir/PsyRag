@@ -31,7 +31,9 @@ useful* is invisible to text and only usage feedback can reveal it — with the
 useful set switching mid-run. Adaptive recall climbs to ~1.0, crashes when
 the world changes (the honest cost of having learned the old regime), and
 re-learns to ~0.9; the same engine with feedback off, and BM25, never leave
-the floor. Feedback is attention-limited, not an oracle. Reproduce it:
+the floor. Add negative feedback ("opened it, wasted my time") and the
+exploration floor, and re-learning reaches ~0.97 — the orange line. Feedback
+is attention-limited, not an oracle. Reproduce it:
 
 ```bash
 cargo run --release -p psyrag --example adaptive_bench

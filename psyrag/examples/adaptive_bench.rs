@@ -264,10 +264,11 @@ fn svg_chart(series: &[(&str, &str, &[f64])], shift_at: usize, episodes: usize) 
             ly += 14.0;
         }
         placed_label_ys.push(ly);
+        // Right-anchored at the plot edge so any label length fits.
         s += &format!(
-            r##"<text x="{0}" y="{1}" fill="{color}" font-weight="bold">{name}</text>
+            r##"<text x="{0}" y="{1}" fill="{color}" font-weight="bold" text-anchor="end">{name}</text>
 "##,
-            x((episodes - 1) as f64) - 62.0,
+            x((episodes - 1) as f64) - 4.0,
             ly
         );
     }
@@ -288,6 +289,17 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
+    let arg_f32 = |name: &str, default: f32| -> f32 {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    // --contrastive: examined-but-useless docs earn -0.3 (click feedback
+    // with a negative half). --explore-floor F: Config::explore_floor.
+    let contrastive = args.iter().any(|a| a == "--contrastive");
+    let explore_floor = arg_f32("--explore-floor", 0.0);
     let topics = arg_usize("--topics", 20);
     let episodes = arg_usize("--episodes", 60);
     let docs_per_topic = 8;
@@ -310,17 +322,28 @@ fn main() {
         // re-learnable. (Aggressive theta tombstones the post-shift useful
         // edges during phase 1 and recovery caps out.)
         theta: 0.005,
+        explore_floor,
         ..Config::default()
     };
 
     let g = build_graph(&corpus, t0);
     let mut adaptive = PlasticityLayer::new(cfg.clone());
     adaptive.sync(&g);
-    let mut static_l = PlasticityLayer::new(cfg);
+    let mut static_l = PlasticityLayer::new(cfg.clone());
     static_l.sync(&g);
+    // 4th system: contrastive feedback (examined-but-useless = -0.3) WITH the
+    // exploration floor that makes negative credit safe (issue #29). Its
+    // attention draws use a separate RNG stream so the three series above
+    // stay byte-identical to earlier runs.
+    let mut contrastive_l = PlasticityLayer::new(Config {
+        explore_floor: 0.05,
+        ..cfg
+    });
+    contrastive_l.sync(&g);
+    let mut rng_c = Rng::new(43);
 
-    let mut rows: Vec<(usize, f64, f64, f64, f64, f64, f64)> = Vec::new();
-    let (mut a3, mut s3, mut b3) = (vec![], vec![], vec![]);
+    let mut rows: Vec<(usize, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    let (mut a3, mut s3, mut b3, mut c3) = (vec![], vec![], vec![], vec![]);
 
     for e in 0..episodes {
         let ts = t0 + ((e + 1) as i64) * episode_gap_ms;
@@ -331,7 +354,8 @@ fn main() {
                 &corpus.useful_after[t]
             }
         };
-        let (mut ar, mut am, mut sr, mut sm, mut br, mut bm) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut ar, mut am, mut sr, mut sm, mut br, mut bm, mut cr) =
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         for t in 0..topics {
             let useful = phase_useful(t);
             // adaptive: retrieve, score, then feed back which docs were used
@@ -351,16 +375,23 @@ fn main() {
             // new regime unrecoverable — a real dynamics finding this bench
             // surfaced; tracked as a GitHub issue.)
             let session_gives_feedback = rng.below(100) < 80;
-            let used: Vec<(String, f32)> = ranked
-                .iter()
-                .enumerate()
-                .filter(|(rank, m)| {
-                    session_gives_feedback
-                        && useful.contains(m)
-                        && (*rank < 3 || rng.below(100) < 25)
-                })
-                .map(|(_, m)| (doc_name(t, *m), 1.0))
-                .collect();
+            // RNG draws happen in exactly the same order as the committed
+            // positive-only run (a draw only for a *creditable* doc past
+            // rank 3), so the default chart stays byte-identical.
+            let mut used: Vec<(String, f32)> = Vec::new();
+            for (rank, m) in ranked.iter().enumerate() {
+                if !session_gives_feedback {
+                    break;
+                }
+                let is_useful = useful.contains(m);
+                if !is_useful && !contrastive {
+                    continue;
+                }
+                let examined = rank < 3 || rng.below(100) < 25;
+                if examined {
+                    used.push((doc_name(t, *m), if is_useful { 1.0 } else { -0.3 }));
+                }
+            }
             if !used.is_empty() {
                 adaptive.apply_credit(&g, &trace, &Credit::Nodes(used), ts);
             }
@@ -373,35 +404,61 @@ fn main() {
             let sc = score(&bm25_rank(&corpus, t), useful);
             br += sc.recall_at3;
             bm += sc.mrr;
+            // adaptive + contrastive + explore floor
+            let (ranked_c, trace_c, mass_c) = psyrag_rank(&mut contrastive_l, &g, t, top_k, ts);
+            cr += score(&ranked_c, useful).recall_at3;
+            contrastive_l.observe(mass_c);
+            let gives = rng_c.below(100) < 80;
+            let mut graded: Vec<(String, f32)> = Vec::new();
+            for (rank, m) in ranked_c.iter().enumerate() {
+                if !gives {
+                    break;
+                }
+                if rank < 3 || rng_c.below(100) < 25 {
+                    let c = if useful.contains(m) { 1.0 } else { -0.3 };
+                    graded.push((doc_name(t, *m), c));
+                }
+            }
+            if !graded.is_empty() {
+                contrastive_l.apply_credit(&g, &trace_c, &Credit::Nodes(graded), ts);
+            }
         }
         let n = topics as f64;
         // nightly consolidation (prune + renormalize) every 8 episodes
         if e % 8 == 7 {
             adaptive.consolidate(&g, ts);
             static_l.consolidate(&g, ts);
+            contrastive_l.consolidate(&g, ts);
         }
-        rows.push((e, ar / n, am / n, sr / n, sm / n, br / n, bm / n));
+        rows.push((e, ar / n, am / n, sr / n, sm / n, br / n, bm / n, cr / n));
         a3.push(ar / n);
         s3.push(sr / n);
         b3.push(br / n);
+        c3.push(cr / n);
     }
 
     // ---- outputs ----
     let mut csv = String::from(
-        "episode,adaptive_recall@3,adaptive_mrr,static_recall@3,static_mrr,bm25_recall@3,bm25_mrr\n",
+        "episode,adaptive_recall@3,adaptive_mrr,static_recall@3,static_mrr,bm25_recall@3,bm25_mrr,contrastive_floor_recall@3\n",
     );
-    for (e, a, am, s, sm, b, bm) in &rows {
-        csv += &format!("{e},{a:.4},{am:.4},{s:.4},{sm:.4},{b:.4},{bm:.4}\n");
+    for (e, a, am, s, sm, b, bm, c) in &rows {
+        csv += &format!("{e},{a:.4},{am:.4},{s:.4},{sm:.4},{b:.4},{bm:.4},{c:.4}\n");
     }
     let final_window = |v: &[f64]| -> f64 {
         let k = 5.min(v.len());
         v.iter().rev().take(k).sum::<f64>() / k as f64
     };
-    let (fa, fs, fb) = (final_window(&a3), final_window(&s3), final_window(&b3));
+    let (fa, fs, fb, fc) = (
+        final_window(&a3),
+        final_window(&s3),
+        final_window(&b3),
+        final_window(&c3),
+    );
     let pre_shift = final_window(&a3[..shift_at.min(a3.len())]);
     println!("adaptive-recall benchmark — {topics} topics x {docs_per_topic} docs, {episodes} episodes, shift at {shift_at}");
     println!("  final recall@3 (last-5 mean):  adaptive {fa:.3}   static {fs:.3}   bm25 {fb:.3}");
     println!("  adaptive pre-shift plateau: {pre_shift:.3} — re-learned after the shift: {fa:.3}");
+    println!("  adaptive + contrastive feedback + explore_floor 0.05: re-learned to {fc:.3}");
 
     if check {
         assert!(
@@ -412,15 +469,24 @@ fn main() {
             fa > 0.8 * pre_shift,
             "post-shift recovery ({fa:.3}) fell below 80% of the pre-shift plateau ({pre_shift:.3})"
         );
+        assert!(
+            fc >= fa,
+            "contrastive feedback with the exploration floor ({fc:.3}) must recover at least as well as positive-only ({fa:.3}) — issue #29 regression"
+        );
         println!("  --check: PASS");
         return;
     }
 
+    if contrastive || explore_floor > 0.0 {
+        println!("  (variant run: not overwriting bench/results.*)");
+        return;
+    }
     std::fs::create_dir_all("bench").expect("create bench/");
     std::fs::write("bench/results.csv", &csv).expect("write csv");
     let chart = svg_chart(
         &[
             ("adaptive", "#1a9c5c", &a3),
+            ("adaptive+contrastive", "#d97706", &c3),
             ("static", "#8a8f98", &s3),
             ("bm25", "#3b7dd8", &b3),
         ],

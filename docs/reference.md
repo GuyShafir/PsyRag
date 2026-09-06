@@ -419,3 +419,4 @@ behavior to existing edges, not just new ones.
 | `sleep_downscale` | 0.6 | multiplicative weight downscale (<1) |
 | `sleep_theta` | 0.05 | aggressive prune floor after downscale |
 | `protect_top_frac` | 0.2 | top fraction by weight protected from the sleep prune |
+| `explore_floor` | 0.0 | exploration floor as a fraction of `w0`: bounds negative-credit depression in stored state and guarantees every live edge a minimum retrieval salience (a lens; dead edges unaffected). 0 = off. Turn on (e.g. 0.05) whenever you feed negative credit — without it a depressed edge hits exactly 0, gets pruned, and can never be re-learned (issue #29) |
