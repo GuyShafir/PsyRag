@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 — 2026-09-06
+
+### The claim, measured
+- `bench/`: a deterministic, zero-dependency adaptive-recall benchmark
+  (`cargo run --release -p psyrag --example adaptive_bench`). 20 topics x 8
+  candidates with a hidden useful subset invisible to text; attention-limited
+  feedback (not an oracle); the useful set shifts mid-run. Adaptive recall
+  climbs 0.28 -> 1.0, crashes below the static floor at the shift, and
+  re-learns to ~0.88; the feedback-off ablation and BM25 never move. The
+  README now leads with the chart, and CI asserts the claim on every push
+  (`--check`), so it can never silently go stale. Two dynamics findings
+  documented in `docs/bench.md` (prune floor x regime shift; depression +
+  renormalization crushing post-shift candidates — issue #29).
 
 ### Graph analytics over the wire
 - `POST /blast` — blast-radius reachability at an instant, every hit carrying
@@ -9,6 +21,21 @@
   the versioned history. Both were library-only since v0.3; now exposed over
   HTTP, in the console (Graph tab / Maintenance tab), and in the Python
   client (`blast()`, `diff()`).
+
+### MCP hardening (follow-ups from the #19 review)
+- Out-of-repo paths no longer leak into the graph; one sidecar save per
+  Read/Edit event instead of two; model-facing `k`/`depth` clamped
+  (1..=100 / 1..=8); socket lines capped at 1 MiB.
+
+### Fuzzing (community contribution)
+- `fuzz/` cargo-fuzz targets for WAL replay and entity JSON (by
+  @VedantMadane, closing #26): workspace-excluded so the zero-dep build is
+  untouched, weekly + manual time-budgeted runs with an evolving cached
+  corpus and crash artifacts, plus a PR-time compile guard.
+
+### Community
+- `CONTRIBUTING.md` and issue templates; seeded good-first-issues
+  (#23 `/graph` pagination, #24 PITR tooling, #25 cgroup-aware memory).
 
 ## v0.6.0 — 2026-07-28
 
