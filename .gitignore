@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 # local working notes
 TODO.md
+.DS_Store
