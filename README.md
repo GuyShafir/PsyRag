@@ -3,6 +3,7 @@
 [![CI](https://github.com/GuyShafir/PsyRag/actions/workflows/ci.yml/badge.svg)](https://github.com/GuyShafir/PsyRag/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/GuyShafir/PsyRag)](https://github.com/GuyShafir/PsyRag/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Website](https://img.shields.io/badge/website-guyshafir.github.io%2FPsyRag-4aa3ff)](https://guyshafir.github.io/PsyRag/)
 
 **Adaptive graph memory that learns what to remember.**
 
