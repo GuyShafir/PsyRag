@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PsyRag</title>
+<meta name="description" content="PsyRag is an open-source memory database for AI agents whose recall learns from use: results that prove useful grow stronger, the rest fade. Zero dependencies, benchmarked, production-grade.">
+<meta property="og:title" content="PsyRag — adaptive graph memory that learns what to remember">
+<meta property="og:description" content="A memory database for AI agents whose recall learns from use. Benchmarked, zero dependencies, Apache-2.0.">
+<meta property="og:image" content="https://guyshafir.github.io/PsyRag/assets/retrieve.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%234aa3ff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: the console's own dark palette carried onto a long editorial page;
+     one wide reading column, the chart given full width, type does the work. */
+  :root{
+    --bg:#0e1116; --panel:#161b22; --line:#232a34; --fg:#d7dde5; --mut:#8b97a7;
+    --acc:#4aa3ff; --good:#39d98a; --warn:#d97706; --bad:#ff6b6b;
+    --display:"Fraunces",Georgia,"Times New Roman",serif;
+    --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    color-scheme:dark;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f6f7f9; --panel:#ffffff; --line:#dde2ea; --fg:#171c24; --mut:#5a6473;
+      --acc:#1f6fd6; --good:#18894f; --warn:#b45309; --bad:#c62828; color-scheme:light;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#f6f7f9; --panel:#ffffff; --line:#dde2ea; --fg:#171c24; --mut:#5a6473;
+    --acc:#1f6fd6; --good:#18894f; --warn:#b45309; --bad:#c62828; color-scheme:light;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--fg);font:16px/1.6 var(--body);-webkit-font-smoothing:antialiased}
+  a{color:var(--acc);text-decoration:none}
+  a:hover{text-decoration:underline}
+  :focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+  img{max-width:100%;height:auto;display:block}
+  .wrap{max-width:1040px;margin:0 auto;padding-inline:20px}
+  /* Grid/flex children holding code or tables must be allowed to shrink,
+     or an intrinsic <pre> width pushes the whole page wider than a phone. */
+  .wrap > *, .hero > *, .stack > *, .way > *, .ctas > *, .cloud > *{min-width:0;max-width:100%}
+  pre{max-width:100%}
+  h1,h2,h3{font-family:var(--display);font-weight:600;line-height:1.1;margin:0;text-wrap:balance}
+  h1{font-size:clamp(2.4rem,6vw,4.4rem);letter-spacing:-.02em}
+  h2{font-size:clamp(1.7rem,3.6vw,2.5rem);letter-spacing:-.015em}
+  h3{font-size:1.25rem}
+  p{margin:0;max-width:62ch}
+  .mut{color:var(--mut)}
+  .eyebrow{font-family:var(--mono);font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;color:var(--mut)}
+  code,pre,.mono{font-family:var(--mono)}
+  code{font-size:.92em;background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:.1em .4em}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow-x:auto;margin:0;font-size:.9rem;line-height:1.55}
+  pre code{background:none;border:0;padding:0;font-size:inherit}
+  .cmt{color:var(--mut)}
+
+  header.top{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-block:18px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-weight:500;color:var(--fg)}
+  .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--good);display:inline-block}
+  nav.top a{color:var(--mut);margin-left:18px;font-size:.95rem}
+  nav.top a:hover{color:var(--fg);text-decoration:none}
+
+  section{padding-block:64px}
+  section + section{border-top:1px solid var(--line)}
+  .hero{padding-block:56px 64px;display:grid;gap:28px}
+  .hero p.lede{font-size:1.2rem;max-width:58ch}
+  .snippet{font-size:.88rem}
+  .ctas{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .ctas .kbd{overflow-wrap:anywhere}
+  .btn{display:inline-block;padding:11px 18px;border-radius:8px;font-weight:500;border:1px solid var(--line);color:var(--fg);background:var(--panel)}
+  .btn:hover{text-decoration:none;border-color:var(--acc)}
+  .btn.primary{background:var(--acc);border-color:var(--acc);color:#04101f}
+  .btn.primary:hover{filter:brightness(1.08)}
+
+  .chart{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;max-width:100%}
+  .chart img{width:100%}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:32px;align-items:start}
+  .two > *{min-width:0}
+  @media (max-width:820px){.two{grid-template-columns:1fr}}
+  .stack{display:grid;gap:14px}
+  .ways{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media (max-width:820px){.ways{grid-template-columns:1fr}}
+  .way{display:grid;gap:10px;min-width:0}
+  .way pre{font-size:.82rem}
+  table{width:100%;border-collapse:collapse;font-size:.95rem}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:500;font-family:var(--mono);font-size:.78rem;letter-spacing:.08em;text-transform:uppercase}
+  td:first-child{color:var(--mut)}
+  .tbl{overflow-x:auto}
+  ul.guar{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:1fr 1fr;gap:14px 28px}
+  @media (max-width:820px){ul.guar{grid-template-columns:1fr}}
+  ul.guar li{padding-left:18px;position:relative;max-width:48ch}
+  ul.guar li::before{content:"";position:absolute;left:0;top:.6em;width:8px;height:8px;border-radius:50%;background:var(--good)}
+  ul.guar b{font-weight:500;color:var(--fg)}
+  .shots{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:820px){.shots{grid-template-columns:1fr}}
+  .shot{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)}
+  .shot figcaption{padding:10px 12px;font-size:.85rem;color:var(--mut);border-top:1px solid var(--line)}
+  .cloud{border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:28px;display:grid;gap:16px}
+  footer{padding-block:40px 56px;border-top:1px solid var(--line);font-size:.92rem;color:var(--mut);display:grid;gap:10px}
+  footer a{color:var(--fg)}
+  .kbd{font-family:var(--mono);font-size:.85rem}
+  @media (prefers-reduced-motion: no-preference){.btn{transition:border-color .15s,filter .15s}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#"><span class="dot"></span>PsyRag</a>
+    <nav class="top" aria-label="Site">
+      <a href="#measured">Benchmark</a>
+      <a href="#install">Install</a>
+      <a href="#production">Production</a>
+      <a href="#cloud">Cloud</a>
+      <a href="https://github.com/GuyShafir/PsyRag">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="hero" id="top">
+    <div class="eyebrow">open-source memory database for AI agents · v0.7.0 · Apache-2.0</div>
+    <h1>Adaptive graph memory that learns what to remember.</h1>
+    <p class="lede">PsyRag stores facts as a temporal typed graph and, unlike vector or keyword memory, it adapts: connections that get used grow stronger, connections that don't decay, and an offline sleep cycle consolidates what matters. Recall reorders itself by learned usefulness.</p>
+    <pre class="snippet"><code><span class="cmt">same query "pricing", before and after "metering" proved useful 20×:</span>
+  before:  model 0.15   uses 0.15   seats 0.15   metering 0.15   alpha 0.15
+  after :  metering 0.33   model 0.04   uses 0.04   seats 0.04   alpha 0.04</code></pre>
+    <div class="ctas">
+      <a class="btn primary" href="#install">Install</a>
+      <a class="btn" href="#measured">See the benchmark</a>
+      <span class="mut kbd">or for Claude Code: <code>claude mcp add psyrag -- psyrag mcp</code></span>
+    </div>
+  </section>
+
+  <section id="measured">
+    <div class="stack" style="gap:22px">
+      <div class="eyebrow">the claim, measured</div>
+      <h2>Where a RAG store returns the same thing forever, PsyRag learns.</h2>
+      <p>A deterministic, zero-dependency benchmark: 20 topics, 8 candidate docs each, all lexically identical to their query. A hidden 3-of-8 are truly useful, and which ones is invisible to text. Only usage feedback can reveal it, and the feedback is attention-limited: top-3 results are always examined, deeper ones rarely, some sessions give nothing at all. Halfway through, the useful set silently changes.</p>
+      <figure class="chart"><img src="assets/results.svg" alt="Line chart of recall@3 per episode. Adaptive recall climbs from 0.28 to 1.0, crashes to 0 when the useful set shifts at episode 30, and re-learns to about 0.9. With contrastive feedback and the exploration floor it recovers to about 0.97. The static ablation and BM25 stay flat near 0.3 to 0.47 throughout." width="760" height="340"></figure>
+      <div class="two">
+        <div class="stack">
+          <h3>What the lines mean</h3>
+          <p><b>Adaptive</b> climbs from the no-signal floor to 1.0 in about twenty episodes. When the world changes it crashes to zero, below the static floor: the cost of having learned the old regime. Then it re-learns to 0.88 from nothing but the feedback stream.</p>
+          <p><b>Adaptive with negative feedback</b> ("opened it, wasted my time") learns faster and recovers to 0.97. That series exists because the benchmark first exposed a bug: the weight update could drive an edge to exactly zero, where it was pruned and could never be re-learned. The fix, an exploration floor, shipped in v0.7.0.</p>
+          <p><b>Static</b> is the same engine with feedback off. <b>BM25</b> is the classic lexical baseline. Neither ever leaves the floor, because the signal is invisible to them.</p>
+        </div>
+        <div class="stack">
+          <h3>Reproduce it</h3>
+          <pre><code>git clone https://github.com/GuyShafir/PsyRag
+cd PsyRag
+cargo run --release -p psyrag --example adaptive_bench</code></pre>
+          <p class="mut">Seeded RNG, fixed timestamps: every run reproduces the chart byte-for-byte. CI asserts the result on every push, so this chart can never silently go stale against the code. Design notes in <a href="https://github.com/GuyShafir/PsyRag/blob/main/docs/bench.md">docs/bench.md</a>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="stack" style="gap:22px">
+      <div class="eyebrow">three ways in</div>
+      <h2>One binary. No dependencies to speak of.</h2>
+      <p>The whole dependency tree is <code>serde</code>, <code>serde_json</code> and <code>tiny_http</code>. Binaries for Linux (x86-64, arm64) and macOS (Apple silicon), a multi-arch Docker image, and an MCP server for Claude Code.</p>
+      <div class="ways">
+        <div class="way">
+          <h3>Binary</h3>
+          <pre><code><span class="cmt"># macOS (Apple silicon); linux x86-64 and arm64 on the releases page</span>
+curl -L https://github.com/GuyShafir/PsyRag/releases/latest/download/psyrag-v0.7.0-aarch64-apple-darwin.tar.gz | tar xz
+./psyrag --wal mem.wal serve
+<span class="cmt"># web console at http://localhost:8080/</span></code></pre>
+        </div>
+        <div class="way">
+          <h3>Docker</h3>
+          <pre><code>docker run -p 8080:8080 \
+  -v psyrag-data:/data \
+  ghcr.io/guyshafir/psyrag:latest</code></pre>
+          <p class="mut">Multi-tenant: <code>--data-dir</code> gives every agent or tenant an isolated database under <code>/db/{name}/…</code>.</p>
+        </div>
+        <div class="way">
+          <h3>Claude Code (MCP)</h3>
+          <pre><code>claude mcp add psyrag -- psyrag mcp</code></pre>
+          <p class="mut">A local adaptive memory for your repo: it learns a file co-touch graph from what the agent reads and edits, and recall reorders around how you actually work. Wiring in <a href="https://github.com/GuyShafir/PsyRag/blob/main/docs/mcp.md">docs/mcp.md</a>.</p>
+        </div>
+      </div>
+      <div class="shots">
+        <figure class="shot"><img src="assets/retrieve.png" alt="PsyRag console, Retrieve tab: a retrieval for 'alice' with the fired activation paths drawn in blue on the graph and a ranked results table showing origin and activation." width="1440" height="900"><figcaption>Retrieve and see <em>why</em>: the fired activation paths, drawn on the graph, with provenance per result.</figcaption></figure>
+        <figure class="shot"><img src="assets/trust.png" alt="PsyRag console, Trust tab: an origin prefix web:crawler/ marked quarantined with a restore button, and a purge-by-origin panel requiring retyped confirmation." width="1440" height="900"><figcaption>Every fact knows where it came from. Quarantine a hostile source with one click; purge it entirely when you must.</figcaption></figure>
+      </div>
+    </div>
+  </section>
+
+  <section id="different">
+    <div class="stack" style="gap:22px">
+      <div class="eyebrow">why it's different</div>
+      <h2>Memory that behaves like a mind, stored like a database.</h2>
+      <div class="tbl"><table>
+        <thead><tr><th></th><th>vector / keyword memory</th><th>PsyRag</th></tr></thead>
+        <tbody>
+          <tr><td>structure</td><td>flat chunks</td><td>temporal typed graph: relationships, validity intervals</td></tr>
+          <tr><td>recall</td><td>static similarity</td><td>weighted spreading activation that learns from use</td></tr>
+          <tr><td>forgetting</td><td>TTL or manual</td><td>decay, homeostasis, sleep consolidation</td></tr>
+          <tr><td>truth changes</td><td>overwrite</td><td>native supersession, time-travel diff, blast radius</td></tr>
+          <tr><td>signal</td><td>none</td><td>citations, task outcomes, clicks, file-opens reshape recall</td></tr>
+          <tr><td>provenance</td><td>none</td><td>per-fact origin, trust quarantine, purge-by-subject (GDPR)</td></tr>
+          <tr><td>semantic entry</td><td>the whole model</td><td>bring-your-own embeddings pick the seeds; the learned graph does the expansion</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section id="production">
+    <div class="stack" style="gap:22px">
+      <div class="eyebrow">production-grade, proven in CI on every push</div>
+      <h2>Built like a database, not a demo.</h2>
+      <ul class="guar">
+        <li><b>Durability.</b> CRC-framed, fsynced WAL with single-writer locking. A 2xx means it is on disk, proven by a kill -9 crash suite and real disk-full fault injection.</li>
+        <li><b>Learned state survives operations.</b> Weights are keyed by stable edge identity, so checkpoints, purges and restarts never lose what the graph has learned.</li>
+        <li><b>Warm standby.</b> A read-only replica tails the primary's WAL, keeps learned weights warm, and promotes with one restart. Zero acked-write loss, drilled in CI.</li>
+        <li><b>Idempotent writes.</b> Retries can never double-ingest or double-apply credit, even across restarts.</li>
+        <li><b>Isolation and security.</b> Per-database WALs, locks and quotas; full, read-only and per-database tokens; feedback poisoning limits.</li>
+        <li><b>Operability.</b> Prometheus metrics, structured logs, built-in maintenance scheduling, backup and verify tooling, an ops runbook with RPO and RTO.</li>
+      </ul>
+      <p class="mut">About 2,500 requests per second mixed workload with retrieve p95 under 5 ms on a stock CI runner, with the SLOs asserted from the server's own histograms. Weekly coverage-guided fuzzing. The adaptivity itself is pinned by a golden learning-quality suite: recall must reorder around what proved useful, deterministically, or CI fails.</p>
+    </div>
+  </section>
+
+  <section id="cloud">
+    <div class="cloud">
+      <div class="eyebrow">psyrag cloud · register interest</div>
+      <h2>Would you rather we ran it for you?</h2>
+      <p>PsyRag stays fully open source. We are weighing a hosted option on top of it: managed databases with automatic failover, managed backups and point-in-time restore, and support with an SLA. The paid part would be running it for you, never features withheld. Before building anything, we want to know whether you would use it.</p>
+      <div class="ctas">
+        <a class="btn primary" href="https://github.com/GuyShafir/PsyRag/discussions/34">Register interest on GitHub</a>
+        <span class="mut">One reply or a 👍 is enough. A sentence about your workload helps more.</span>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div>Built by <a href="https://github.com/GuyShafir">Guy Shafir</a>. MCP server by <a href="https://github.com/nanov">nanov</a>; coverage-guided fuzzing by <a href="https://github.com/VedantMadane">Vedant Madane</a>. First outside contributors, both shipped real subsystems. Labeled <a href="https://github.com/GuyShafir/PsyRag/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">good first issues</a> are waiting if you want to be the third.</div>
+    <div>Apache-2.0 · <a href="https://github.com/GuyShafir/PsyRag">Source</a> · <a href="https://github.com/GuyShafir/PsyRag/releases">Releases</a> · <a href="https://github.com/GuyShafir/PsyRag/blob/main/docs/reference.md">Reference</a> · <a href="https://github.com/GuyShafir/PsyRag/blob/main/CHANGELOG.md">Changelog</a></div>
+  </footer>
+</div>
+</body>
+</html>
