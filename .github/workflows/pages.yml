@@ -1,0 +1,35 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", "bench/results.svg", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      # The chart on the site is the benchmark's committed output, copied at
+      # deploy time so the product page can never drift from the code.
+      - name: Sync benchmark chart into the site
+        run: cp bench/results.svg site/assets/results.svg
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
